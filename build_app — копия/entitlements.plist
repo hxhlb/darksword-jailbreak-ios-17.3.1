@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>application-identifier</key>
+	<string>V945SAD4LF.soft.ru.app</string>
+	<key>com.apple.developer.accessibility.merchant-api-control</key>
+	<true/>
+	<key>com.apple.developer.devicecheck.appattest-environment</key>
+	<array>
+		<string>development</string>
+		<string>production</string>
+	</array>
+	<key>com.apple.developer.in-app-payments</key>
+	<array/>
+	<key>com.apple.developer.kernel.extended-virtual-addressing</key>
+	<true/>
+	<key>com.apple.developer.kernel.increased-memory-limit</key>
+	<true/>
+	<key>com.apple.developer.networking.slicing.appcategory</key>
+	<array>
+		<string>communication-9000</string>
+		<string>games-6014</string>
+		<string>streaming-9001</string>
+	</array>
+	<key>com.apple.developer.networking.slicing.trafficcategory</key>
+	<array>
+		<string>defaultslice-1</string>
+		<string>video-2</string>
+		<string>background-3</string>
+		<string>voice-4</string>
+		<string>callsignaling-5</string>
+		<string>responsivedata-6</string>
+		<string>avstreaming-7</string>
+		<string>responsiveav-8</string>
+	</array>
+	<key>com.apple.developer.networking.wifi-info</key>
+	<true/>
+	<key>com.apple.developer.pay-later-merchandising</key>
+	<array>
+		<string>payinfour-merchandising</string>
+	</array>
+	<key>com.apple.developer.team-identifier</key>
+	<string>V945SAD4LF</string>
+	<key>com.apple.security.iokit-user-client-class</key>
+	<array>
+		<string>IOSurfaceRoot</string>
+		<string>IOSurfaceRootUserClient</string>
+	</array>
+	<key>get-task-allow</key>
+	<true/>
+	<key>keychain-access-groups</key>
+	<array>
+		<string>V945SAD4LF.*</string>
+		<string>com.apple.token</string>
+	</array>
+</dict>
+</plist>
